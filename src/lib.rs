@@ -1,24 +1,20 @@
+mod connection;
+mod error;
+mod protocol;
+
+pub use crate::error::Error;
+
+use crate::connection::Connection;
+use crate::error::Result;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::TcpStream;
-use tokio::sync::Mutex;
-
-// TODO: have our own error type
-pub type Error = Box<dyn std::error::Error + Send + Sync>;
-pub type Result<T, E = Error> = std::result::Result<T, E>;
-
-#[derive(Debug, thiserror::Error)]
-enum FaktoryError {
-    #[error("unexpected response: got {0}, expected {1}")]
-    UnexpectedResponse(String, String),
-}
+use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard};
 
 #[derive(Debug, Clone)]
-pub struct Client {
+pub struct Config {
     //password?: string;
     //labels: string[];
     //wid?: string;
@@ -27,127 +23,43 @@ pub struct Client {
     uri: String,
 }
 
-#[derive(Debug)]
-pub struct Connection {
-    reader: BufReader<OwnedReadHalf>,
-    writer: OwnedWriteHalf,
+impl Config {
+    pub fn from_uri(uri: impl Into<String>) -> Self {
+        Self { uri: uri.into() }
+    }
 }
 
-impl Connection {
-    pub async fn new(uri: &str) -> Result<Self> {
-        let (reader, writer) = TcpStream::connect(&uri).await?.into_split();
-        let mut conn = Connection {
-            reader: BufReader::new(reader),
-            writer,
-        };
-        println!("Created conn");
-        conn.validate_response("+HI {\"v\":2}\r\n").await?;
-        println!("Got OK to hi");
-
-        conn.hello().await?;
-
-        Ok(conn)
-    }
-
-    pub async fn hello(&mut self) -> Result<()> {
-        println!("Sending hello");
-        Hello::default().send(&mut self.writer).await?;
-        println!("Sent hello");
-        self.validate_response("+OK\r\n").await?;
-        println!("Got OK to hello");
-
-        Ok(())
-    }
-
-    async fn validate_response(&mut self, expected: &str) -> Result<()> {
-        let mut output = String::new();
-        self.reader.read_line(&mut output).await?;
-        if output != expected {
-            return Err(FaktoryError::UnexpectedResponse(
-                output,
-                expected.to_owned(),
-            ))?;
-        }
-        Ok(())
-    }
-
-    pub async fn close(mut self) -> Result<()> {
-        Ok(self.writer.write_all(b"END").await?)
-    }
+#[derive(Debug, Clone)]
+pub struct Client {
+    conn: Arc<Mutex<Option<Connection>>>,
 }
 
 impl Client {
-    pub async fn connect(&self) -> Result<Connection> {
-        Connection::new(&self.uri).await
+    pub async fn new(config: &Config) -> Result<Self> {
+        Ok(Self {
+            conn: Arc::new(Mutex::new(Some(Connection::new(config).await?))),
+        })
     }
-}
 
-#[derive(Debug, Clone)]
-pub struct Consumer {
-    conn: Arc<Mutex<Connection>>,
-    queues: Vec<String>,
-}
+    async fn conn(&self) -> Result<MappedMutexGuard<'_, Connection>> {
+        let guard = MutexGuard::try_map(self.conn.lock().await, |guard| guard.as_mut())
+            .map_err(|_| Error::ConnectionAlreadyClosed)?;
+        Ok(guard)
+    }
 
-impl Consumer {
-    pub async fn fetch(&mut self) -> Result<Option<Job>> {
-        println!("Sending fetch");
-        Fetch {
-            queues: &self.queues,
-        }
-        .send(&mut self.conn.lock().await.writer)
-        .await?;
-        println!("Sent");
+    pub async fn fetch(&self, queues: &[String]) -> Result<Option<Job>> {
+        self.conn().await?.fetch(queues).await
+    }
 
-        let mut output = String::new();
-        self.conn.lock().await.reader.read_line(&mut output).await?;
+    pub async fn push(&self, job: Job) -> Result<()> {
+        self.conn().await?.push(job).await
+    }
 
-        if !output.starts_with("$") || output.len() <= 3 {
-            return Err(FaktoryError::UnexpectedResponse(output, "$".to_owned()))?;
-        }
-        if output == "$-1\r\n" {
-            return Ok(None);
-        }
-
-        let len: usize = output[1..output.len() - 2].parse()?;
-        let mut output = vec![0; len];
-        self.conn
-            .lock()
+    pub async fn close(self) -> Result<()> {
+        std::mem::take(&mut *self.conn.lock().await)
+            .ok_or(Error::ConnectionAlreadyClosed)?
+            .close()
             .await
-            .reader
-            .read_exact(&mut output)
-            .await?;
-        self.conn
-            .lock()
-            .await
-            .reader
-            .read_exact(&mut [0; 2])
-            .await?;
-        Ok(Some(serde_json::from_slice(&output)?))
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Producer {
-    conn: Arc<Mutex<Connection>>,
-}
-
-impl Producer {
-    pub async fn push(&mut self, job: Job) -> Result<()> {
-        println!("Sending push");
-        Push(job).send(&mut self.conn.lock().await.writer).await?;
-        println!("Sent");
-        self.conn.lock().await.validate_response("+OK\r\n").await?;
-        Ok(())
-    }
-}
-
-pub struct Push(Job);
-
-impl Push {
-    async fn send<W: AsyncWrite + Unpin>(&self, w: &mut W) -> Result<(), Error> {
-        w.write_all(b"PUSH ").await?;
-        w.write_all(&serde_json::to_vec(&self.0)?).await?;
-        Ok(w.write_all(b"\r\n").await?)
     }
 }
 
@@ -229,7 +141,7 @@ pub struct Job {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Failure {
+struct Failure {
     retry_count: usize,
     failed_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -243,64 +155,6 @@ pub struct Failure {
     backtrace: Option<Vec<String>>,
 }
 
-pub struct Fetch<'a> {
-    queues: &'a [String],
-}
-
-impl<'a> Fetch<'a> {
-    async fn send<W: AsyncWrite + Unpin>(&self, w: &mut W) -> Result<()> {
-        if self.queues.is_empty() {
-            w.write_all(b"FETCH\r\n").await?;
-        } else {
-            w.write_all(b"FETCH ").await?;
-            w.write_all(self.queues.join(" ").as_bytes()).await?;
-            w.write_all(b"\r\n").await?;
-        }
-        Ok(())
-    }
-}
-
-#[derive(Serialize)]
-pub struct Hello {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hostname: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub wid: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pid: Option<usize>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub labels: Vec<String>,
-
-    #[serde(rename = "v")]
-    version: usize,
-
-    /// Hash is hex(sha256(password + salt))
-    #[serde(rename = "pwdhash")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    password_hash: Option<String>,
-}
-
-impl Default for Hello {
-    fn default() -> Self {
-        Hello {
-            hostname: None,
-            wid: None,
-            pid: None,
-            labels: Vec::new(),
-            password_hash: None,
-            version: 2,
-        }
-    }
-}
-
-impl Hello {
-    async fn send<W: AsyncWrite + Unpin>(&self, w: &mut W) -> Result<()> {
-        w.write_all(b"HELLO ").await?;
-        w.write_all(&serde_json::to_vec(&self)?).await?;
-        Ok(w.write_all(b"\r\n").await?)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,40 +162,44 @@ mod tests {
 
     #[tokio::test]
     async fn it_consumes() {
-        let client = Client {
-            uri: "localhost:7419".to_string(),
-        };
-        let conn = client.connect().await.expect("unable to connect");
+        let client = Client::new(&Config::from_uri("localhost:7419"))
+            .await
+            .expect("unable to connect to faktory");
         panic!(
             "{:?}",
-            Consumer {
-                conn: Arc::new(conn.into()),
-                queues: vec!["default".to_owned()]
-            }
-            .fetch()
-            .await
-            .expect("fetch failed"),
+            client
+                .fetch(&["default".to_owned()])
+                .await
+                .expect("fetch failed"),
         );
     }
 
     #[tokio::test]
     async fn it_produces() {
-        let client = Client {
-            uri: "localhost:7419".to_string(),
-        };
-        let conn = client.connect().await.expect("unable to connect");
+        let client = Client::new(&Config::from_uri("localhost:7419"))
+            .await
+            .expect("unable to connect to faktory");
         let random_jid = Uuid::new_v4().to_string();
 
-        Producer {
-            conn: Arc::new(conn.into()),
-        }
-        .push(Job {
-            jid: random_jid.clone(),
-            kind: "def".to_owned(),
-            args: Vec::new(),
-            ..Default::default()
-        })
-        .await
-        .expect("fetch failed");
+        client
+            .push(Job {
+                jid: random_jid.clone(),
+                kind: "def".to_owned(),
+                args: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .expect("fetch failed");
+    }
+
+    #[tokio::test]
+    async fn it_doesnt_disconnect_twice() {
+        let client = Client::new(&Config::from_uri("localhost:7419"))
+            .await
+            .expect("unable to connect to faktory");
+
+        assert!(client.clone().close().await.is_ok());
+        assert!(client.close().await.is_err());
+        //assert_eq!(client.close().await, Err(FaktoryError::ConnectionAlreadyClosed));
     }
 }
