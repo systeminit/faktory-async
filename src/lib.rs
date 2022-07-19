@@ -7,6 +7,7 @@ pub use crate::error::Error;
 use crate::connection::Connection;
 use crate::error::Result;
 
+use uuid::Uuid;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -141,7 +142,7 @@ pub struct Job {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct Failure {
+pub struct Failure {
     retry_count: usize,
     failed_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -155,10 +156,66 @@ struct Failure {
     backtrace: Option<Vec<String>>,
 }
 
+
+impl Job {
+    /// Create a new job of type `kind`, with the given arguments.
+    pub fn new<S, A>(kind: S, args: Vec<A>) -> Self
+    where
+        S: Into<String>,
+        A: Into<serde_json::Value>,
+    {
+        let random_jid = Uuid::new_v4().to_string();
+        Job {
+            jid: random_jid,
+            queue: Some("default".into()),
+            kind: kind.into(),
+            args: args.into_iter().map(|s| s.into()).collect(),
+
+            created_at: Some(Utc::now()),
+            enqueued_at: None,
+            at: None,
+            reserve_for: Some(600),
+            retry: Some(25),
+            priority: Some(5),
+            backtrace: Some(0),
+            failure: None,
+            custom: Default::default(),
+        }
+    }
+
+    /// Place this job on the given `queue`.
+    ///
+    /// If this method is not called (or `self.queue` set otherwise), the queue will be set to
+    /// "default".
+    pub fn on_queue<S: Into<String>>(mut self, queue: S) -> Self {
+        self.queue = Some(queue.into());
+        self
+    }
+
+    /// This job's id.
+    pub fn id(&self) -> &str {
+        &self.jid
+    }
+
+    /// This job's type.
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// The arguments provided for this job.
+    pub fn args(&self) -> &[serde_json::Value] {
+        &self.args
+    }
+
+    /// Data about this job's most recent failure.
+    pub fn failure(&self) -> &Option<Failure> {
+        &self.failure
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uuid::Uuid;
 
     #[tokio::test]
     async fn it_consumes() {
