@@ -1,9 +1,11 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 
 // TODO: have our own error type
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -80,9 +82,9 @@ impl Client {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Consumer {
-    conn: Connection,
+    conn: Arc<Mutex<Connection>>,
     queues: Vec<String>,
 }
 
@@ -92,12 +94,12 @@ impl Consumer {
         Fetch {
             queues: &self.queues,
         }
-        .send(&mut self.conn.writer)
+        .send(&mut self.conn.lock().await.writer)
         .await?;
         println!("Sent");
 
         let mut output = String::new();
-        self.conn.reader.read_line(&mut output).await?;
+        self.conn.lock().await.reader.read_line(&mut output).await?;
 
         if !output.starts_with("$") || output.len() <= 3 {
             return Err(FaktoryError::UnexpectedResponse(output, "$".to_owned()))?;
@@ -108,23 +110,33 @@ impl Consumer {
 
         let len: usize = output[1..output.len() - 2].parse()?;
         let mut output = vec![0; len];
-        self.conn.reader.read_exact(&mut output).await?;
-        self.conn.reader.read_exact(&mut [0; 2]).await?;
+        self.conn
+            .lock()
+            .await
+            .reader
+            .read_exact(&mut output)
+            .await?;
+        self.conn
+            .lock()
+            .await
+            .reader
+            .read_exact(&mut [0; 2])
+            .await?;
         Ok(Some(serde_json::from_slice(&output)?))
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Producer {
-    conn: Connection,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl Producer {
     pub async fn push(&mut self, job: Job) -> Result<()> {
         println!("Sending push");
-        Push(job).send(&mut self.conn.writer).await?;
+        Push(job).send(&mut self.conn.lock().await.writer).await?;
         println!("Sent");
-        self.conn.validate_response("+OK\r\n").await?;
+        self.conn.lock().await.validate_response("+OK\r\n").await?;
         Ok(())
     }
 }
@@ -292,7 +304,7 @@ impl Hello {
 #[cfg(test)]
 mod tests {
     use super::*;
-use uuid::Uuid;
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn it_consumes() {
@@ -303,7 +315,7 @@ use uuid::Uuid;
         panic!(
             "{:?}",
             Consumer {
-                conn,
+                conn: Arc::new(conn.into()),
                 queues: vec!["default".to_owned()]
             }
             .fetch()
@@ -319,15 +331,17 @@ use uuid::Uuid;
         };
         let conn = client.connect().await.expect("unable to connect");
         let random_jid = Uuid::new_v4().to_string();
-        
-        Producer { conn }
-            .push(Job {
-                jid: random_jid.clone(),
-                kind: "def".to_owned(),
-                args: Vec::new(),
-                ..Default::default()
-            })
-            .await
-            .expect("fetch failed");
+
+        Producer {
+            conn: Arc::new(conn.into()),
+        }
+        .push(Job {
+            jid: random_jid.clone(),
+            kind: "def".to_owned(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("fetch failed");
     }
 }
