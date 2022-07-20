@@ -3,16 +3,17 @@ mod error;
 mod protocol;
 
 pub use crate::error::Error;
+pub use crate::protocol::{BatchConfig, FailConfig, BeatReply};
 
 use crate::connection::Connection;
 use crate::error::Result;
 
-use uuid::Uuid;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard};
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -48,12 +49,36 @@ impl Client {
         Ok(guard)
     }
 
+    pub async fn last_beat(&self) -> Result<BeatReply> {
+        Ok(self.conn().await?.last_beat())
+    }
+
+    pub async fn beat(&self) -> Result<BeatReply> {
+        self.conn().await?.beat().await
+    }
+
     pub async fn fetch(&self, queues: &[String]) -> Result<Option<Job>> {
         self.conn().await?.fetch(queues).await
     }
 
+    pub async fn ack(&self, jid: String) -> Result<()> {
+        self.conn().await?.ack(jid).await
+    }
+
+    pub async fn fail(&self, config: FailConfig) -> Result<()> {
+        self.conn().await?.fail(config).await
+    }
+
     pub async fn push(&self, job: Job) -> Result<()> {
         self.conn().await?.push(job).await
+    }
+
+    pub async fn batch_create(&self, config: BatchConfig) -> Result<String> {
+        self.conn().await?.batch_create(config).await
+    }
+
+    pub async fn batch_commit(&self, id: String) -> Result<()> {
+        self.conn().await?.batch_commit(id).await
     }
 
     pub async fn close(self) -> Result<()> {
@@ -156,7 +181,6 @@ pub struct Failure {
     backtrace: Option<Vec<String>>,
 }
 
-
 impl Job {
     /// Create a new job of type `kind`, with the given arguments.
     pub fn new<S, A>(kind: S, args: Vec<A>) -> Self
@@ -218,17 +242,143 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn it_consumes() {
+    async fn it_consumes_ack() {
         let client = Client::new(&Config::from_uri("localhost:7419"))
             .await
             .expect("unable to connect to faktory");
-        panic!(
-            "{:?}",
+
+        let random_queue = Uuid::new_v4().to_string();
+        let random_jid = Uuid::new_v4().to_string();
+
+        assert!(client
+            .fetch(&["it_consumes".to_owned()])
+            .await
+            .expect("fetch failed")
+            .is_none());
+
+        client
+            .push(Job {
+                jid: random_jid.clone(),
+                kind: "def".to_owned(),
+                queue: Some(random_queue.clone()),
+                args: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .expect("fetch failed");
+
+        assert_eq!(
             client
-                .fetch(&["default".to_owned()])
+                .fetch(&[random_queue.clone()])
                 .await
-                .expect("fetch failed"),
+                .expect("fetch failed")
+                .expect("got no job")
+                .jid,
+            random_jid
         );
+
+        assert!(client
+            .fetch(&["it_consumes".to_owned()])
+            .await
+            .expect("fetch failed")
+            .is_none());
+
+        client.ack(random_jid.clone()).await.expect("ack failed");
+        //assert!(client.ack(random_jid.clone()).await.is_err());
+        assert!(client
+            .fail(
+                FailConfig::new(
+                    random_jid.clone(),
+                    "my msg".to_owned(),
+                    "my-err-kind".to_owned(),
+                    None
+                )
+                .expect("unable to create config")
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn it_consumes_fail() {
+        let client = Client::new(&Config::from_uri("localhost:7419"))
+            .await
+            .expect("unable to connect to faktory");
+
+        let random_queue = Uuid::new_v4().to_string();
+        let random_jid = Uuid::new_v4().to_string();
+
+        assert!(client
+            .fetch(&["it_consumes".to_owned()])
+            .await
+            .expect("fetch failed")
+            .is_none());
+
+        client
+            .push(Job {
+                jid: random_jid.clone(),
+                kind: "def".to_owned(),
+                queue: Some(random_queue.clone()),
+                args: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .expect("fetch failed");
+
+        assert_eq!(
+            client
+                .fetch(&[random_queue.clone()])
+                .await
+                .expect("fetch failed")
+                .expect("got no job")
+                .jid,
+            random_jid
+        );
+
+        assert!(client
+            .fetch(&["it_consumes".to_owned()])
+            .await
+            .expect("fetch failed")
+            .is_none());
+
+        client
+            .fail(
+                FailConfig::new(
+                    random_jid.clone(),
+                    "my msg".to_owned(),
+                    "my-err-kind".to_owned(),
+                    None,
+                )
+                .expect("unable to create config"),
+            )
+            .await
+            .expect("unable to fail job");
+        assert!(client
+            .fail(
+                FailConfig::new(
+                    random_jid.clone(),
+                    "my msg".to_owned(),
+                    "my-err-kind".to_owned(),
+                    None
+                )
+                .expect("unable to create config")
+            )
+            .await
+            .is_err());
+        //assert!(client.ack(random_jid.clone()).await.is_err());
+
+        //tokio::time::sleep(Duration::from_secs(40)).await;
+
+        //assert_eq!(
+        //    client
+        //        .fetch(&[random_queue.clone()])
+        //        .await
+        //        .expect("fetch failed")
+        //        .expect("got no job")
+        //        .jid,
+        //    random_jid
+        //);
+        //client.ack(random_jid.clone()).await.expect("ack failed");
     }
 
     #[tokio::test]
@@ -241,12 +391,13 @@ mod tests {
         client
             .push(Job {
                 jid: random_jid.clone(),
+                queue: Some("it_produces".to_owned()),
                 kind: "def".to_owned(),
                 args: Vec::new(),
                 ..Default::default()
             })
             .await
-            .expect("fetch failed");
+            .expect("push failed");
     }
 
     #[tokio::test]
@@ -258,5 +409,20 @@ mod tests {
         assert!(client.clone().close().await.is_ok());
         assert!(client.close().await.is_err());
         //assert_eq!(client.close().await, Err(FaktoryError::ConnectionAlreadyClosed));
+    }
+
+    #[tokio::test]
+    async fn it_beats() {
+        let client = Client::new(&Config::from_uri("localhost:7419"))
+            .await
+            .expect("unable to connect to faktory");
+
+        assert_eq!(client.beat().await.expect("unable to beat"), BeatReply::Ok);
+        assert_eq!(client.last_beat().await.expect("unable to get last beat"), BeatReply::Ok);
+        assert_eq!(client.beat().await.expect("unable to beat"), BeatReply::Ok);
+        assert_eq!(client.last_beat().await.expect("unable to get last beat"), BeatReply::Ok);
+        assert_eq!(client.beat().await.expect("unable to beat"), BeatReply::Ok);
+        assert_eq!(client.last_beat().await.expect("unable to get last beat"), BeatReply::Ok);
+        assert_eq!(client.beat().await.expect("unable to beat"), BeatReply::Ok);
     }
 }

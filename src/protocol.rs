@@ -1,44 +1,48 @@
-use crate::{error::Result, Error, Job};
-use serde::Serialize;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use crate::{Job, error::Result, Error};
+use serde::{Serialize, Deserialize};
 
-pub(crate) struct Push(Job);
-
-impl Push {
-    pub(crate) fn new(job: Job) -> Self {
-        Self(job)
-    }
-
-    pub(crate) async fn send<W: AsyncWrite + Unpin>(&self, w: &mut W) -> Result<(), Error> {
-        w.write_all(b"PUSH ").await?;
-        w.write_all(&serde_json::to_vec(&self.0)?).await?;
-        Ok(w.write_all(b"\r\n").await?)
-    }
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum BeatReply {
+    Ok,
+    Quiet,
+    Terminate,
 }
 
-pub(crate) struct Fetch<'a> {
-    queues: &'a [String],
+#[derive(Debug, Serialize)]
+pub struct FailConfig {
+    jid: String,
+    message: String,
+    errtype: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backtrace: Option<Vec<String>>,
 }
 
-impl<'a> Fetch<'a> {
-    pub(crate) fn new(queues: &'a [String]) -> Self {
-        Self { queues }
-    }
-
-    pub(crate) async fn send<W: AsyncWrite + Unpin>(&self, w: &mut W) -> Result<()> {
-        if self.queues.is_empty() {
-            w.write_all(b"FETCH\r\n").await?;
-        } else {
-            w.write_all(b"FETCH ").await?;
-            w.write_all(self.queues.join(" ").as_bytes()).await?;
-            w.write_all(b"\r\n").await?;
+impl FailConfig {
+    pub fn new(jid: String, message: String, errtype: String, backtrace: Option<Vec<String>>) -> Result<Self> {
+        if message.len() > 1000 {
+            return Err(Error::FailMessageTooLong(message.len()));
         }
-        Ok(())
+        Ok(Self {
+            jid, message, errtype, backtrace
+        })
     }
+}
+
+#[derive(Debug, Serialize, Default)]
+pub struct BatchConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_bid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    success: Option<Job>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    complete: Option<Job>,
 }
 
 #[derive(Serialize)]
-pub(crate) struct Hello {
+pub(crate) struct HelloConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -57,9 +61,9 @@ pub(crate) struct Hello {
     password_hash: Option<String>,
 }
 
-impl Default for Hello {
+impl Default for HelloConfig {
     fn default() -> Self {
-        Hello {
+        Self {
             hostname: None,
             wid: None,
             pid: None,
@@ -67,13 +71,5 @@ impl Default for Hello {
             password_hash: None,
             version: 2,
         }
-    }
-}
-
-impl Hello {
-    pub(crate) async fn send<W: AsyncWrite + Unpin>(&self, w: &mut W) -> Result<()> {
-        w.write_all(b"HELLO ").await?;
-        w.write_all(&serde_json::to_vec(&self)?).await?;
-        Ok(w.write_all(b"\r\n").await?)
     }
 }

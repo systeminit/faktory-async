@@ -9,9 +9,24 @@ pub enum Error {
     SerdeJson(#[from] serde_json::Error),
     #[error(transparent)]
     ParseInt(#[from] std::num::ParseIntError),
+    #[error(transparent)]
+    FromUtf8(#[from] std::string::FromUtf8Error),
 
     #[error("unexpected response: got {0}, expected {1}")]
     UnexpectedResponse(String, String),
     #[error("tried to operate on a connection that was explicitly closed")]
     ConnectionAlreadyClosed,
+    #[error("received empty message")]
+    ReceivedEmptyMessage,
+    #[error("received invalid error message {0}")]
+    ReceivedInvalidErrorMessage(String),
+    #[error("missing carriage return")]
+    MissingCarriageReturn,
+    #[error("received error message of kind {0}: {1}")]
+    ReceivedErrorMessage(String, String),
+    #[error("fail message too long, max length is 1000, got {0}")]
+    FailMessageTooLong(usize),
+    // The ruby clients says that if you get this you should ditch the socket and create another one
+    #[error("invalid message prefix {0}")]
+    InvalidMessagePrefix(String),
 }
