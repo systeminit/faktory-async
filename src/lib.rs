@@ -19,6 +19,7 @@ use uuid::Uuid;
 pub struct Config {
     //password?: string;
     //labels: string[];
+    does_consume: bool,
     hostname: Option<String>,
     uri: String,
 }
@@ -28,7 +29,12 @@ impl Config {
         Self {
             uri: uri.into(),
             hostname: None,
+            does_consume: false,
         }
+    }
+
+    pub fn does_consume(&mut self) {
+        self.does_consume = true;
     }
 
     pub fn set_hostname(&mut self, hostname: impl Into<String>) {
@@ -38,14 +44,24 @@ impl Config {
 
 #[derive(Debug, Clone)]
 pub struct Client {
+    config: Config,
     conn: Arc<Mutex<Option<Connection>>>,
 }
 
 impl Client {
     pub async fn new(config: &Config) -> Result<Self> {
         Ok(Self {
+            config: config.clone(),
             conn: Arc::new(Mutex::new(Some(Connection::new(config).await?))),
         })
+    }
+
+    pub async fn reconnect_if_needed(&self) -> Result<()> {
+        let mut conn = self.conn.lock().await;
+        if conn.is_none() {
+            *conn = Some(Connection::new(&self.config).await?);
+        }
+        Ok(())
     }
 
     async fn conn(&self) -> Result<MappedMutexGuard<'_, Connection>> {
@@ -291,14 +307,12 @@ mod tests {
         client.ack(random_jid.clone()).await.expect("ack failed");
         //assert!(client.ack(random_jid.clone()).await.is_err());
         assert!(client
-            .fail(
-                FailConfig::new(
-                    random_jid.clone(),
-                    "my msg".to_owned(),
-                    "my-err-kind".to_owned(),
-                    None
-                )
-            )
+            .fail(FailConfig::new(
+                random_jid.clone(),
+                "my msg".to_owned(),
+                "my-err-kind".to_owned(),
+                None
+            ))
             .await
             .is_err());
     }
@@ -346,25 +360,21 @@ mod tests {
             .is_none());
 
         client
-            .fail(
-                FailConfig::new(
-                    random_jid.clone(),
-                    "my msg".to_owned(),
-                    "my-err-kind".to_owned(),
-                    None,
-                )
-            )
+            .fail(FailConfig::new(
+                random_jid.clone(),
+                "my msg".to_owned(),
+                "my-err-kind".to_owned(),
+                None,
+            ))
             .await
             .expect("unable to fail job");
         assert!(client
-            .fail(
-                FailConfig::new(
-                    random_jid.clone(),
-                    "my msg".to_owned(),
-                    "my-err-kind".to_owned(),
-                    None
-                )
-            )
+            .fail(FailConfig::new(
+                random_jid.clone(),
+                "my msg".to_owned(),
+                "my-err-kind".to_owned(),
+                None
+            ))
             .await
             .is_err());
         //assert!(client.ack(random_jid.clone()).await.is_err());

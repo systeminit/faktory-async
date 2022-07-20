@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 #[derive(Debug)]
 pub(crate) struct Connection {
-    wid: String,
+    wid: Option<String>,
     reader: BufReader<OwnedReadHalf>,
     writer: OwnedWriteHalf,
     last_beat: BeatReply,
@@ -17,7 +17,11 @@ pub(crate) struct Connection {
 impl Connection {
     pub async fn new(config: &Config) -> Result<Self> {
         let (reader, writer) = TcpStream::connect(&config.uri).await?.into_split();
-        let wid = Uuid::new_v4().to_string();
+        let wid = if config.does_consume {
+            Some(Uuid::new_v4().to_string())
+        } else {
+            None
+        };
         let mut conn = Connection {
             wid: wid.clone(),
             reader: BufReader::new(reader),
@@ -31,7 +35,7 @@ impl Connection {
         let mut config = HelloConfig::default();
         config.pid = Some(std::process::id() as usize);
         config.labels = vec!["faktory-async-rust".to_owned()];
-        config.wid = Some(wid);
+        config.wid = wid;
         conn.hello(config).await?;
 
         Ok(conn)
