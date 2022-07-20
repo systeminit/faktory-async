@@ -1,5 +1,5 @@
-use crate::{Job, error::Result, Error};
-use serde::{Serialize, Deserialize};
+use crate::Job;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -19,13 +19,19 @@ pub struct FailConfig {
 }
 
 impl FailConfig {
-    pub fn new(jid: String, message: String, errtype: String, backtrace: Option<Vec<String>>) -> Result<Self> {
-        if message.len() > 1000 {
-            return Err(Error::FailMessageTooLong(message.len()));
+    pub fn new(
+        jid: String,
+        mut message: String,
+        errtype: String,
+        backtrace: Option<Vec<String>>,
+    ) -> Self {
+        message.truncate(1000);
+        Self {
+            jid,
+            message,
+            errtype,
+            backtrace,
         }
-        Ok(Self {
-            jid, message, errtype, backtrace
-        })
     }
 }
 

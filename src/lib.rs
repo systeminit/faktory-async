@@ -3,7 +3,7 @@ mod error;
 mod protocol;
 
 pub use crate::error::Error;
-pub use crate::protocol::{BatchConfig, FailConfig, BeatReply};
+pub use crate::protocol::{BatchConfig, BeatReply, FailConfig};
 
 use crate::connection::Connection;
 use crate::error::Result;
@@ -19,15 +19,20 @@ use uuid::Uuid;
 pub struct Config {
     //password?: string;
     //labels: string[];
-    //wid?: string;
-    //connectionFactory: ConnectionFactory;
-    //pool: Pool<Connection>;
+    hostname: Option<String>,
     uri: String,
 }
 
 impl Config {
     pub fn from_uri(uri: impl Into<String>) -> Self {
-        Self { uri: uri.into() }
+        Self {
+            uri: uri.into(),
+            hostname: None,
+        }
+    }
+
+    pub fn set_hostname(&mut self, hostname: impl Into<String>) {
+        self.hostname = Some(hostname.into());
     }
 }
 
@@ -293,7 +298,6 @@ mod tests {
                     "my-err-kind".to_owned(),
                     None
                 )
-                .expect("unable to create config")
             )
             .await
             .is_err());
@@ -349,7 +353,6 @@ mod tests {
                     "my-err-kind".to_owned(),
                     None,
                 )
-                .expect("unable to create config"),
             )
             .await
             .expect("unable to fail job");
@@ -361,7 +364,6 @@ mod tests {
                     "my-err-kind".to_owned(),
                     None
                 )
-                .expect("unable to create config")
             )
             .await
             .is_err());
@@ -418,11 +420,20 @@ mod tests {
             .expect("unable to connect to faktory");
 
         assert_eq!(client.beat().await.expect("unable to beat"), BeatReply::Ok);
-        assert_eq!(client.last_beat().await.expect("unable to get last beat"), BeatReply::Ok);
+        assert_eq!(
+            client.last_beat().await.expect("unable to get last beat"),
+            BeatReply::Ok
+        );
         assert_eq!(client.beat().await.expect("unable to beat"), BeatReply::Ok);
-        assert_eq!(client.last_beat().await.expect("unable to get last beat"), BeatReply::Ok);
+        assert_eq!(
+            client.last_beat().await.expect("unable to get last beat"),
+            BeatReply::Ok
+        );
         assert_eq!(client.beat().await.expect("unable to beat"), BeatReply::Ok);
-        assert_eq!(client.last_beat().await.expect("unable to get last beat"), BeatReply::Ok);
+        assert_eq!(
+            client.last_beat().await.expect("unable to get last beat"),
+            BeatReply::Ok
+        );
         assert_eq!(client.beat().await.expect("unable to beat"), BeatReply::Ok);
     }
 }

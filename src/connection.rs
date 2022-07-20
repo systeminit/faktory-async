@@ -29,6 +29,8 @@ impl Connection {
 
         // TODO: improve hello config usage
         let mut config = HelloConfig::default();
+        config.pid = Some(std::process::id() as usize);
+        config.labels = vec!["faktory-async-rust".to_owned()];
         config.wid = Some(wid);
         conn.hello(config).await?;
 
@@ -49,7 +51,9 @@ impl Connection {
     pub async fn beat(&mut self) -> Result<BeatReply> {
         self.send_command(
             "BEAT",
-            vec![serde_json::to_string(&serde_json::json!({ "wid": self.wid }))?],
+            vec![serde_json::to_string(
+                &serde_json::json!({ "wid": self.wid }),
+            )?],
         )
         .await?;
         match self.read_string().await?.as_deref() {
