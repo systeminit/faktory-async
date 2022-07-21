@@ -56,12 +56,14 @@ impl Client {
         })
     }
 
-    pub async fn reconnect_if_needed(&self) -> Result<()> {
+    pub async fn reconnect_if_needed(&self) -> Result<bool> {
         let mut conn = self.conn.lock().await;
         if conn.is_none() {
             *conn = Some(Connection::new(&self.config).await?);
+            Ok(true)
+        } else {
+            Ok(false)
         }
-        Ok(())
     }
 
     async fn conn(&self) -> Result<MappedMutexGuard<'_, Connection>> {
@@ -102,7 +104,7 @@ impl Client {
         self.conn().await?.batch_commit(id).await
     }
 
-    pub async fn close(self) -> Result<()> {
+    pub async fn close(&self) -> Result<()> {
         std::mem::take(&mut *self.conn.lock().await)
             .ok_or(Error::ConnectionAlreadyClosed)?
             .close()
