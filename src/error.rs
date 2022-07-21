@@ -24,8 +24,6 @@ pub enum Error {
     MissingCarriageReturn,
     #[error("received error message of kind {0}: {1}")]
     ReceivedErrorMessage(String, String),
-    #[error("fail message too long, max length is 1000, got {0}")]
-    FailMessageTooLong(usize),
     // The ruby clients says that if you get this you should ditch the socket and create another one
     #[error("invalid message prefix {0}")]
     InvalidMessagePrefix(String),

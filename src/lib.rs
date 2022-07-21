@@ -104,6 +104,18 @@ impl Client {
         self.conn().await?.batch_commit(id).await
     }
 
+    pub async fn reconnect(&self) -> Result<()> {
+        let mut conn = self.conn.lock().await;
+        if let Some(conn) = std::mem::take(&mut *conn) {
+            let _ = conn.close().await;
+        }
+
+        // If connect fails here, caller will need to retry
+        *conn = Some(Connection::new(&self.config).await?);
+
+        Ok(())
+    }
+
     pub async fn close(&self) -> Result<()> {
         std::mem::take(&mut *self.conn.lock().await)
             .ok_or(Error::ConnectionAlreadyClosed)?
