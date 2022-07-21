@@ -8,14 +8,17 @@ use uuid::Uuid;
 
 #[derive(Debug)]
 pub(crate) struct Connection {
+    config: Config,
     wid: Option<String>,
     reader: BufReader<OwnedReadHalf>,
     writer: OwnedWriteHalf,
     last_beat: BeatState,
+    inside_rw: bool,
+    retries: usize,
 }
 
 impl Connection {
-    pub async fn new(config: &Config) -> Result<Self> {
+    pub async fn new(config: Config) -> Result<Self> {
         let (reader, writer) = TcpStream::connect(&config.uri).await?.into_split();
         let wid = if config.does_consume {
             Some(Uuid::new_v4().to_string())
@@ -23,10 +26,13 @@ impl Connection {
             None
         };
         let mut conn = Connection {
+            config,
             wid: wid.clone(),
             reader: BufReader::new(reader),
             writer,
             last_beat: BeatState::Ok,
+            inside_rw: false,
+            retries: 0,
         };
         // TODO: properly parse the HI response
         conn.validate_response("HI {\"v\":2}").await?;
@@ -45,7 +51,7 @@ impl Connection {
         self.last_beat
     }
 
-    pub async fn close(mut self) -> Result<()> {
+    pub async fn close(&mut self) -> Result<()> {
         self.send_command("END", vec![]).await?;
         Ok(())
     }
@@ -132,11 +138,89 @@ impl Connection {
         Ok(())
     }
 
-    async fn send_command(&mut self, key: impl Into<String>, args: Vec<String>) -> Result<()> {
+    #[async_recursion::async_recursion]
+    async fn send_command(&mut self, key: &'static str, args: Vec<String>) -> Result<()> {
         let mut args = vec![key.into(), args.into_iter().collect::<Vec<_>>().join(" ")].join(" ");
         args.push_str("\r\n");
-        self.writer.write_all(dbg!(args).as_bytes()).await?;
+
+        let was_inside_rw = std::mem::replace(&mut self.inside_rw, true);
+        while let Err(err) = self.writer.write_all(dbg!(&args).as_bytes()).await {
+            let _ = self.close().await;
+            *self = match Self::new(self.config.clone()).await {
+                Ok(c) => c,
+                err @ Err(Error::ReceivedErrorMessage(_, _)) => return err.map(|_| ()),
+                Err(_) => {
+                    if self.retries > 5 {
+                        return Err(err)?;
+                    }
+
+                    self.retries += 1;
+                    continue;
+                }
+            }
+        }
+        if !was_inside_rw {
+            self.retries = 0;
+        }
+
         Ok(())
+    }
+
+    #[async_recursion::async_recursion]
+    async fn read_string(&mut self) -> Result<Option<String>> {
+        loop {
+            match read_string_fallible(self).await {
+                Ok(msg) => return Ok(msg),
+                err @ Err(Error::ReceivedErrorMessage(_, _)) => return err,
+                Err(err) => {
+                    *self = match Self::new(self.config.clone()).await {
+                        Ok(c) => c,
+                        Err(_) => return Err(err),
+                    }
+                }
+            }
+        }
+
+        async fn read_string_fallible(conn: &mut Connection) -> Result<Option<String>> {
+            let mut output = String::new();
+            conn.reader.read_line(&mut output).await?;
+
+            if dbg!(&output).is_empty() {
+                return Err(Error::ReceivedEmptyMessage);
+            }
+            if !output.ends_with("\r\n") {
+                return Err(Error::MissingCarriageReturn);
+            }
+
+            match output.remove(0) {
+                '$' => {
+                    if output == "-1\r\n" {
+                        return Ok(None);
+                    }
+
+                    let len: usize = output[0..output.len() - 2].parse()?;
+                    let mut output = vec![0; len];
+                    conn.reader.read_exact(&mut output).await?;
+                    //conn.reader.read_line(&mut String::new())?;
+                    conn.reader.read_exact(&mut [0; 2]).await?;
+                    Ok(Some(String::from_utf8(output)?))
+                }
+                '+' => {
+                    output.truncate(output.len() - 2);
+                    Ok(Some(output))
+                }
+                '-' => {
+                    let (kind, msg) = output
+                        .split_once(" ")
+                        .ok_or_else(|| Error::ReceivedInvalidErrorMessage(output.clone()))?;
+                    Err(Error::ReceivedErrorMessage(
+                        kind.to_owned(),
+                        msg[..msg.len() - 2].to_owned(),
+                    ))
+                }
+                prefix => Err(Error::InvalidMessagePrefix(format!("{prefix}{output}"))),
+            }
+        }
     }
 
     async fn validate_response(&mut self, expected: &str) -> Result<()> {
@@ -148,46 +232,5 @@ impl Connection {
             return Err(Error::UnexpectedResponse(output, expected.to_owned()))?;
         }
         Ok(())
-    }
-
-    async fn read_string(&mut self) -> Result<Option<String>> {
-        let mut output = String::new();
-        self.reader.read_line(&mut output).await?;
-
-        if dbg!(&output).is_empty() {
-            return Err(Error::ReceivedEmptyMessage);
-        }
-        if !output.ends_with("\r\n") {
-            return Err(Error::MissingCarriageReturn);
-        }
-
-        match output.remove(0) {
-            '$' => {
-                if output == "-1\r\n" {
-                    return Ok(None);
-                }
-
-                let len: usize = output[0..output.len() - 2].parse()?;
-                let mut output = vec![0; len];
-                self.reader.read_exact(&mut output).await?;
-                //self.reader.read_line(&mut String::new())?;
-                self.reader.read_exact(&mut [0; 2]).await?;
-                Ok(Some(String::from_utf8(output)?))
-            }
-            '+' => {
-                output.truncate(output.len() - 2);
-                Ok(Some(output))
-            }
-            '-' => {
-                let (kind, msg) = output
-                    .split_once(" ")
-                    .ok_or_else(|| Error::ReceivedInvalidErrorMessage(output.clone()))?;
-                Err(Error::ReceivedErrorMessage(
-                    kind.to_owned(),
-                    msg[..msg.len() - 2].to_owned(),
-                ))
-            }
-            prefix => Err(Error::InvalidMessagePrefix(format!("{prefix}{output}"))),
-        }
     }
 }

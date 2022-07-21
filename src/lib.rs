@@ -52,14 +52,14 @@ impl Client {
     pub async fn new(config: &Config) -> Result<Self> {
         Ok(Self {
             config: config.clone(),
-            conn: Arc::new(Mutex::new(Some(Connection::new(config).await?))),
+            conn: Arc::new(Mutex::new(Some(Connection::new(config.clone()).await?))),
         })
     }
 
     pub async fn reconnect_if_needed(&self) -> Result<bool> {
         let mut conn = self.conn.lock().await;
         if conn.is_none() {
-            *conn = Some(Connection::new(&self.config).await?);
+            *conn = Some(Connection::new(self.config.clone()).await?);
             Ok(true)
         } else {
             Ok(false)
@@ -67,9 +67,21 @@ impl Client {
     }
 
     async fn conn(&self) -> Result<MappedMutexGuard<'_, Connection>> {
-        let guard = MutexGuard::try_map(self.conn.lock().await, |guard| guard.as_mut())
-            .map_err(|_| Error::ConnectionAlreadyClosed)?;
-        Ok(guard)
+        for _ in 0..5 {
+            let guard = match MutexGuard::try_map(self.conn.lock().await, |guard| guard.as_mut()) {
+                Ok(guard) => guard,
+                Err(mut conn) => {
+                    *conn = Connection::new(self.config.clone()).await.ok();
+                    match MutexGuard::try_map(conn, |guard| guard.as_mut()) {
+                        Ok(guard) => guard,
+                        Err(_) => continue,
+                    }
+                }
+            };
+
+            return Ok(guard);
+        }
+        Err(Error::ConnectionAlreadyClosed)
     }
 
     pub async fn last_beat(&self) -> Result<BeatState> {
@@ -106,12 +118,12 @@ impl Client {
 
     pub async fn reconnect(&self) -> Result<()> {
         let mut conn = self.conn.lock().await;
-        if let Some(conn) = std::mem::take(&mut *conn) {
+        if let Some(mut conn) = std::mem::take(&mut *conn) {
             let _ = conn.close().await;
         }
 
         // If connect fails here, caller will need to retry
-        *conn = Some(Connection::new(&self.config).await?);
+        *conn = Some(Connection::new(self.config.clone()).await?);
 
         Ok(())
     }
@@ -439,7 +451,10 @@ mod tests {
 
     #[tokio::test]
     async fn it_beats() {
-        let client = Client::new(&Config::from_uri("localhost:7419"))
+        let mut config = Config::from_uri("localhost:7419");
+        config.does_consume();
+
+        let client = Client::new(&config)
             .await
             .expect("unable to connect to faktory");
 
