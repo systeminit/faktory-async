@@ -2,8 +2,13 @@ use crate::Job;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct BeatReply {
+    pub state: BeatState,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub enum BeatReply {
+pub enum BeatState {
     Ok,
     Quiet,
     Terminate,

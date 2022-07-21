@@ -1,4 +1,4 @@
-use crate::protocol::{BatchConfig, BeatReply, FailConfig, HelloConfig};
+use crate::protocol::{BatchConfig, BeatReply, BeatState, FailConfig, HelloConfig};
 use crate::{Config, Error, Job, Result};
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -11,7 +11,7 @@ pub(crate) struct Connection {
     wid: Option<String>,
     reader: BufReader<OwnedReadHalf>,
     writer: OwnedWriteHalf,
-    last_beat: BeatReply,
+    last_beat: BeatState,
 }
 
 impl Connection {
@@ -26,7 +26,7 @@ impl Connection {
             wid: wid.clone(),
             reader: BufReader::new(reader),
             writer,
-            last_beat: BeatReply::Ok,
+            last_beat: BeatState::Ok,
         };
         // TODO: properly parse the HI response
         conn.validate_response("HI {\"v\":2}").await?;
@@ -41,7 +41,7 @@ impl Connection {
         Ok(conn)
     }
 
-    pub fn last_beat(&self) -> BeatReply {
+    pub fn last_beat(&self) -> BeatState {
         self.last_beat
     }
 
@@ -52,7 +52,7 @@ impl Connection {
 
     // TODO: handle extra arguments: {wid: String, current_state: String, rss_kb: Integer}
     // https://github.com/contribsys/faktory/blob/main/docs/protocol-specification.md#beat-command
-    pub async fn beat(&mut self) -> Result<BeatReply> {
+    pub async fn beat(&mut self) -> Result<BeatState> {
         self.send_command(
             "BEAT",
             vec![serde_json::to_string(
@@ -61,8 +61,14 @@ impl Connection {
         )
         .await?;
         match self.read_string().await?.as_deref() {
-            Some("OK") => Ok(BeatReply::Ok),
-            Some(output) => Ok(serde_json::from_str(&output)?),
+            Some("OK") => {
+                self.last_beat = BeatState::Ok;
+                Ok(BeatState::Ok)
+            }
+            Some(output) => {
+                self.last_beat = serde_json::from_str::<BeatReply>(&output)?.state;
+                Ok(self.last_beat)
+            }
             None => Err(Error::ReceivedEmptyMessage),
         }
     }
