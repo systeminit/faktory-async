@@ -3,7 +3,7 @@ mod error;
 mod protocol;
 
 pub use crate::error::Error;
-pub use crate::protocol::{BatchConfig, BeatReply, FailConfig};
+pub use crate::protocol::{BatchConfig, BeatState, FailConfig};
 
 use crate::connection::Connection;
 use crate::error::Result;
@@ -70,11 +70,11 @@ impl Client {
         Ok(guard)
     }
 
-    pub async fn last_beat(&self) -> Result<BeatReply> {
+    pub async fn last_beat(&self) -> Result<BeatState> {
         Ok(self.conn().await?.last_beat())
     }
 
-    pub async fn beat(&self) -> Result<BeatReply> {
+    pub async fn beat(&self) -> Result<BeatState> {
         self.conn().await?.beat().await
     }
 
@@ -429,21 +429,21 @@ mod tests {
             .await
             .expect("unable to connect to faktory");
 
-        assert_eq!(client.beat().await.expect("unable to beat"), BeatReply::Ok);
+        assert_eq!(client.beat().await.expect("unable to beat"), BeatState::Ok);
         assert_eq!(
             client.last_beat().await.expect("unable to get last beat"),
-            BeatReply::Ok
+            BeatState::Ok
         );
-        assert_eq!(client.beat().await.expect("unable to beat"), BeatReply::Ok);
+        assert_eq!(client.beat().await.expect("unable to beat"), BeatState::Ok);
         assert_eq!(
             client.last_beat().await.expect("unable to get last beat"),
-            BeatReply::Ok
+            BeatState::Ok
         );
-        assert_eq!(client.beat().await.expect("unable to beat"), BeatReply::Ok);
+        assert_eq!(client.beat().await.expect("unable to beat"), BeatState::Ok);
         assert_eq!(
             client.last_beat().await.expect("unable to get last beat"),
-            BeatReply::Ok
+            BeatState::Ok
         );
-        assert_eq!(client.beat().await.expect("unable to beat"), BeatReply::Ok);
+        assert_eq!(client.beat().await.expect("unable to beat"), BeatState::Ok);
     }
 }
