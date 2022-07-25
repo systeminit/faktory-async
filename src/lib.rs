@@ -1,6 +1,6 @@
 mod error;
 
-use faktory_lib_async::{Job, Config, BatchConfig, BeatState, FailConfig, Connection};
+pub use faktory_lib_async::{Job, Config, BatchConfig, BeatState, FailConfig, Connection};
 
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
