@@ -12,4 +12,4 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "1"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.0.0", features = ["v4"] }
-async-recursion = "1.0.0"
+faktory-lib-async = { git = "https://github.com/systeminit/faktory-lib-async", branch = "main" }

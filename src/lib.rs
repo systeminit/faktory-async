@@ -1,478 +1,363 @@
-mod connection;
 mod error;
-mod protocol;
 
-pub use crate::error::Error;
-pub use crate::protocol::{BatchConfig, BeatState, FailConfig};
+use faktory_lib_async::{Job, Config, BatchConfig, BeatState, FailConfig, Connection};
 
-use crate::connection::Connection;
-use crate::error::Result;
+use std::time::Duration;
+use tokio::sync::{broadcast, mpsc, oneshot};
 
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard};
-use uuid::Uuid;
+use crate::error::{Result, Error};
 
-#[derive(Debug, Clone)]
-pub struct Config {
-    //password?: string;
-    //labels: string[];
-    does_consume: bool,
-    hostname: Option<String>,
-    uri: String,
+#[derive(Debug)]
+pub enum FaktoryResponse {
+    Beat(BeatState),
+    Error(Error),
+    Job(Option<Box<Job>>),
+    Ok,
 }
 
-impl Config {
-    pub fn from_uri(uri: impl Into<String>) -> Self {
-        Self {
-            uri: uri.into(),
-            hostname: None,
-            does_consume: false,
-        }
-    }
-
-    pub fn does_consume(&mut self) {
-        self.does_consume = true;
-    }
-
-    pub fn set_hostname(&mut self, hostname: impl Into<String>) {
-        self.hostname = Some(hostname.into());
-    }
+#[derive(Debug)]
+pub enum FaktoryCommand {
+    Ack(String),
+    BatchCommit(String),
+    BatchNew(Box<BatchConfig>),
+    Beat,
+    End,
+    Fail(FailConfig),
+    Fetch(Vec<String>),
+    GetLastBeat,
+    Push(Box<Job>),
 }
+
+pub type FaktoryCommandMessage = (FaktoryCommand, oneshot::Sender<FaktoryResponse>);
+pub type FaktoryCommandSender = mpsc::Sender<FaktoryCommandMessage>;
+pub type FaktoryCommandReceiver = mpsc::Receiver<FaktoryCommandMessage>;
 
 #[derive(Debug, Clone)]
 pub struct Client {
     config: Config,
-    conn: Arc<Mutex<Option<Connection>>>,
+    command_sender: FaktoryCommandSender,
+    beat_shutdown_sender: Option<broadcast::Sender<()>>,
 }
 
 impl Client {
-    pub async fn new(config: &Config) -> Result<Self> {
-        Ok(Self {
+    pub fn new(config: &Config, channel_size: usize) -> Self {
+        let (command_sender, command_receiver) =
+            mpsc::channel::<FaktoryCommandMessage>(channel_size);
+
+        let (beat_shutdown_sender, beat_shutdown_channel) = broadcast::channel(1);
+
+        let client = Self {
             config: config.clone(),
-            conn: Arc::new(Mutex::new(Some(Connection::new(config.clone()).await?))),
-        })
-    }
+            command_sender,
+            beat_shutdown_sender: if config.worker_id.is_some() {
+                Some(beat_shutdown_sender)
+            } else {
+                None
+            },
+        };
 
-    pub async fn reconnect_if_needed(&self) -> Result<bool> {
-        let mut conn = self.conn.lock().await;
-        if conn.is_none() {
-            *conn = Some(Connection::new(self.config.clone()).await?);
-            Ok(true)
-        } else {
-            Ok(false)
+        client.spawn_faktory_connection(command_receiver);
+
+        if config.worker_id.is_some() {
+            client.spawn_heartbeat(beat_shutdown_channel);
         }
-    }
 
-    async fn conn(&self) -> Result<MappedMutexGuard<'_, Connection>> {
-        for _ in 0..5 {
-            let guard = match MutexGuard::try_map(self.conn.lock().await, |guard| guard.as_mut()) {
-                Ok(guard) => guard,
-                Err(mut conn) => {
-                    *conn = Connection::new(self.config.clone()).await.ok();
-                    match MutexGuard::try_map(conn, |guard| guard.as_mut()) {
-                        Ok(guard) => guard,
-                        Err(_) => continue,
-                    }
-                }
-            };
-
-            return Ok(guard);
-        }
-        Err(Error::ConnectionAlreadyClosed)
-    }
-
-    pub async fn last_beat(&self) -> Result<BeatState> {
-        Ok(self.conn().await?.last_beat())
+        client
     }
 
     pub async fn beat(&self) -> Result<BeatState> {
-        self.conn().await?.beat().await
+        match self.send_command(FaktoryCommand::Beat).await? {
+            FaktoryResponse::Beat(beat_state) => Ok(beat_state),
+            other => Err(Error::UnexpectedResponse(
+                format!("{:?}", other),
+                "FaktoryResponse::BeatState".to_string(),
+            )),
+        }
+    }
+
+    pub async fn last_beat(&mut self) -> Result<BeatState> {
+        match self.send_command(FaktoryCommand::GetLastBeat).await? {
+            FaktoryResponse::Beat(beat_state) => Ok(beat_state),
+            other => Err(Error::UnexpectedResponse(
+                format!("{:?}", other),
+                "FaktoryResponse::BeatState".to_string(),
+            )),
+        }
     }
 
     pub async fn fetch(&self, queues: &[String]) -> Result<Option<Job>> {
-        self.conn().await?.fetch(queues).await
+        match self
+            .send_command(FaktoryCommand::Fetch(queues.to_owned()))
+            .await?
+        {
+            FaktoryResponse::Job(Some(job)) => Ok(Some(*job)),
+            FaktoryResponse::Job(None) => Ok(None),
+            other => Err(Error::UnexpectedResponse(
+                format!("{:?}", other),
+                "FaktoryResponse::Job".to_string(),
+            )),
+        }
     }
 
-    pub async fn ack(&self, jid: String) -> Result<()> {
-        self.conn().await?.ack(jid).await
+    pub async fn ack(&self, job_id: String) -> Result<()> {
+        match self.send_command(FaktoryCommand::Ack(job_id)).await? {
+            FaktoryResponse::Ok => Ok(()),
+            other => Err(Error::UnexpectedResponse(
+                format!("{:?}", other),
+                "FaktoryResponse::Ok".to_string(),
+            )),
+        }
     }
 
-    pub async fn fail(&self, config: FailConfig) -> Result<()> {
-        self.conn().await?.fail(config).await
+    pub async fn fail(&self, fail_config: FailConfig) -> Result<()> {
+        match self.send_command(FaktoryCommand::Fail(fail_config)).await? {
+            FaktoryResponse::Ok => Ok(()),
+            other => Err(Error::UnexpectedResponse(
+                format!("{:?}", other),
+                "FaktoryResponse::Ok".to_string(),
+            )),
+        }
     }
 
     pub async fn push(&self, job: Job) -> Result<()> {
-        self.conn().await?.push(job).await
-    }
-
-    pub async fn batch_create(&self, config: BatchConfig) -> Result<String> {
-        self.conn().await?.batch_create(config).await
-    }
-
-    pub async fn batch_commit(&self, id: String) -> Result<()> {
-        self.conn().await?.batch_commit(id).await
-    }
-
-    pub async fn reconnect(&self) -> Result<()> {
-        let mut conn = self.conn.lock().await;
-        if let Some(mut conn) = std::mem::take(&mut *conn) {
-            let _ = conn.close().await;
-        }
-
-        // If connect fails here, caller will need to retry
-        *conn = Some(Connection::new(self.config.clone()).await?);
-
-        Ok(())
-    }
-
-    pub async fn close(&self) -> Result<()> {
-        std::mem::take(&mut *self.conn.lock().await)
-            .ok_or(Error::ConnectionAlreadyClosed)?
-            .close()
-            .await
-    }
-}
-
-/// A Faktory job.
-///
-/// See also the [Faktory wiki](https://github.com/contribsys/faktory/wiki/The-Job-Payload).
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-pub struct Job {
-    /// The job's unique identifier.
-    pub(crate) jid: String,
-
-    /// The queue this job belongs to. Usually `default`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub queue: Option<String>,
-
-    /// The job's type. Called `kind` because `type` is reserved.
-    #[serde(rename = "jobtype")]
-    pub(crate) kind: String,
-
-    /// The arguments provided for this job.
-    pub(crate) args: Vec<serde_json::Value>,
-
-    /// When this job was created.
-    // note that serializing works correctly here since the default chrono serialization
-    // is RFC3339, which is also what Faktory expects.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<DateTime<Utc>>,
-
-    /// When this job was supplied to the Faktory server.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enqueued_at: Option<DateTime<Utc>>,
-
-    /// When this job is scheduled for.
-    ///
-    /// Defaults to immediately.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub at: Option<DateTime<Utc>>,
-
-    /// How long to allow this job to run for.
-    ///
-    /// Defaults to 600 seconds.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reserve_for: Option<usize>,
-
-    /// Number of times to retry this job.
-    ///
-    /// Defaults to 25.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub retry: Option<isize>,
-
-    /// The priority of this job from 1-9 (9 is highest).
-    ///
-    /// Pushing a job with priority 9 will effectively put it at the front of the queue.
-    /// Defaults to 5.
-    pub priority: Option<u8>,
-
-    /// Number of lines of backtrace to keep if this job fails.
-    ///
-    /// Defaults to 0.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub backtrace: Option<usize>,
-
-    /// Data about this job's most recent failure.
-    ///
-    /// This field is read-only.
-    #[serde(skip_serializing)]
-    failure: Option<Failure>,
-
-    /// Extra context to include with the job.
-    ///
-    /// Faktory workers can have plugins and middleware which need to store additional context with
-    /// the job payload. Faktory supports a custom hash to store arbitrary key/values in the JSON.
-    /// This can be extremely helpful for cross-cutting concerns which should propagate between
-    /// systems, e.g. locale for user-specific text translations, request_id for tracing execution
-    /// across a complex distributed system, etc.
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    #[serde(default = "HashMap::default")]
-    pub custom: HashMap<String, serde_json::Value>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Failure {
-    retry_count: usize,
-    failed_at: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    next_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    message: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "errtype")]
-    kind: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    backtrace: Option<Vec<String>>,
-}
-
-impl Job {
-    /// Create a new job of type `kind`, with the given arguments.
-    pub fn new<S, A>(kind: S, args: Vec<A>) -> Self
-    where
-        S: Into<String>,
-        A: Into<serde_json::Value>,
-    {
-        let random_jid = Uuid::new_v4().to_string();
-        Job {
-            jid: random_jid,
-            queue: Some("default".into()),
-            kind: kind.into(),
-            args: args.into_iter().map(|s| s.into()).collect(),
-
-            created_at: Some(Utc::now()),
-            enqueued_at: None,
-            at: None,
-            reserve_for: Some(600),
-            retry: Some(25),
-            priority: Some(5),
-            backtrace: Some(0),
-            failure: None,
-            custom: Default::default(),
+        match self
+            .send_command(FaktoryCommand::Push(job.into()))
+            .await?
+        {
+            FaktoryResponse::Ok => Ok(()),
+            other => Err(Error::UnexpectedResponse(
+                format!("{:?}", other),
+                "FaktoryResponse::Ok".to_string(),
+            )),
         }
     }
 
-    /// Place this job on the given `queue`.
-    ///
-    /// If this method is not called (or `self.queue` set otherwise), the queue will be set to
-    /// "default".
-    pub fn on_queue<S: Into<String>>(mut self, queue: S) -> Self {
-        self.queue = Some(queue.into());
-        self
+    pub async fn batch_commit(&self, batch_id: String) -> Result<()> {
+        match self
+            .send_command(FaktoryCommand::BatchCommit(batch_id))
+            .await?
+        {
+            FaktoryResponse::Ok => Ok(()),
+            other => Err(Error::UnexpectedResponse(
+                format!("{:?}", other),
+                "FaktoryResponse::Ok".to_string(),
+            )),
+        }
     }
 
-    /// This job's id.
-    pub fn id(&self) -> &str {
-        &self.jid
+    pub async fn batch_new(&self, batch_config: BatchConfig) -> Result<()> {
+        match self
+            .send_command(FaktoryCommand::BatchNew(batch_config.into()))
+            .await?
+        {
+            FaktoryResponse::Ok => Ok(()),
+            other => Err(Error::UnexpectedResponse(
+                format!("{:?}", other),
+                "FaktoryResponse::Ok".to_string(),
+            )),
+        }
     }
 
-    /// This job's type.
-    pub fn kind(&self) -> &str {
-        &self.kind
+    pub async fn end(&self) -> Result<()> {
+        match self.send_command(FaktoryCommand::End).await? {
+            FaktoryResponse::Ok => Ok(()),
+            other => Err(Error::UnexpectedResponse(
+                format!("{:?}", other),
+                "FaktoryResponse::Ok".to_string(),
+            )),
+        }
     }
 
-    /// The arguments provided for this job.
-    pub fn args(&self) -> &[serde_json::Value] {
-        &self.args
+    pub async fn send_command(&self, command: FaktoryCommand) -> Result<FaktoryResponse> {
+        let (response_sender, response_receiver) = oneshot::channel();
+
+        self.command_sender.send((command, response_sender)).await?;
+        match response_receiver.await? {
+            FaktoryResponse::Error(err) => Err(err),
+            other => Ok(other),
+        }
     }
 
-    /// Data about this job's most recent failure.
-    pub fn failure(&self) -> &Option<Failure> {
-        &self.failure
+    // Spawns a task that owns our connection to the faktory server
+    fn spawn_faktory_connection(&self, mut command_receiver: FaktoryCommandReceiver) {
+        let config = self.config.clone();
+        let beat_shutdown_sender = self.beat_shutdown_sender.clone();
+        tokio::task::spawn(async move {
+            let connection = Connection::new(config.clone()).await;
+            if connection.is_err() {
+                if let Some(beat_shutdown_sender) = beat_shutdown_sender {
+                    let _ = beat_shutdown_sender.send(());
+                }
+
+                return;
+            }
+
+            let mut connection = connection.unwrap();
+            while let Some((cmd, response)) = command_receiver.recv().await {
+                match cmd {
+                    FaktoryCommand::Ack(job_id) => match connection.ack(job_id).await {
+                        Ok(_) => {
+                            response.send(FaktoryResponse::Ok).unwrap();
+                        }
+                        Err(err) => {
+                            response.send(FaktoryResponse::Error(err.into())).unwrap();
+                        }
+                    },
+                    FaktoryCommand::BatchCommit(batch_id) => {
+                        match connection.batch_commit(batch_id).await {
+                            Ok(_) => {
+                                response.send(FaktoryResponse::Ok).unwrap();
+                            }
+                            Err(err) => {
+                                response.send(FaktoryResponse::Error(err.into())).unwrap();
+                            }
+                        }
+                    }
+                    FaktoryCommand::BatchNew(batch_config) => {
+                        match connection.batch_new(*batch_config).await {
+                            Ok(_) => {
+                                response.send(FaktoryResponse::Ok).unwrap();
+                            }
+                            Err(err) => {
+                                response.send(FaktoryResponse::Error(err.into())).unwrap();
+                            }
+                        }
+                    }
+                    FaktoryCommand::Beat => match connection.beat().await {
+                        Ok(beat_state) => {
+                            response.send(FaktoryResponse::Beat(beat_state)).unwrap();
+                        }
+                        Err(err) => {
+                            response.send(FaktoryResponse::Error(err.into())).unwrap();
+                        }
+                    },
+                    // The end command will close this connection. It attemps to send "End" to the
+                    // server, but will not fail even if that fails (because the server has gone away,
+                    // for example)
+                    FaktoryCommand::End => {
+                        match connection.end().await {
+                            Ok(_) => {
+                                response.send(FaktoryResponse::Ok).unwrap();
+                            }
+                            Err(err) => {
+                                response.send(FaktoryResponse::Error(err.into())).unwrap();
+                            }
+                        }
+
+                        if let Some(beat_shutdown_sender) = beat_shutdown_sender {
+                            let _ = beat_shutdown_sender.send(());
+                        }
+
+                        // We sent end, so we should die, no matter what
+                        return;
+                    }
+                    FaktoryCommand::Fetch(queues) => match connection.fetch(&queues).await {
+                        Ok(job) => {
+                            response.send(FaktoryResponse::Job(job.map(Into::into))).unwrap();
+                        }
+                        Err(err) => {
+                            response.send(FaktoryResponse::Error(err.into())).unwrap();
+                        }
+                    },
+                    FaktoryCommand::Fail(fail_config) => match connection.fail(fail_config).await {
+                        Ok(_) => {
+                            response.send(FaktoryResponse::Ok).unwrap();
+                        }
+                        Err(err) => {
+                            response.send(FaktoryResponse::Error(err.into())).unwrap();
+                        }
+                    },
+                    FaktoryCommand::GetLastBeat => {
+                        response
+                            .send(FaktoryResponse::Beat(connection.last_beat()))
+                            .unwrap();
+                    }
+                    FaktoryCommand::Push(job) => match connection.push(*job).await {
+                        Ok(_) => {
+                            response.send(FaktoryResponse::Ok).unwrap();
+                        }
+                        Err(err) => {
+                            // info!("Error pushing job to faktory: {err}");
+                            response.send(FaktoryResponse::Error(err.into())).unwrap();
+                        }
+                    },
+                }
+            }
+        });
+    }
+
+    // If we're a worker, spawn a heartbeat task that sends a BEAT message to faktory every
+    // ~15 seconds
+    fn spawn_heartbeat(
+        &self,
+        mut beat_shutdown_channel: broadcast::Receiver<()>,
+    ) {
+        let clone = self.clone();
+        tokio::task::spawn(async move {
+            loop {
+                if let Ok(beat_state) = clone.beat().await {
+                    match beat_state {
+                        BeatState::Ok => {}
+                        // Both the Quiet and Terminate states from the
+                        // faktory server mean that we should initiate a
+                        // shutdown. So don't send an additional beat.
+                        BeatState::Quiet | BeatState::Terminate => break,
+                    }
+                }
+
+                tokio::select! {
+                    _ = beat_shutdown_channel.recv() => {
+                        break;
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(15)) => {}
+                }
+            }
+        });
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     #[tokio::test]
-    async fn it_consumes_ack() {
-        let client = Client::new(&Config::from_uri("localhost:7419"))
-            .await
-            .expect("unable to connect to faktory");
+    async fn it_pushes_and_fetches_and_acks() {
+        let client = Client::new(
+            &Config::from_uri(
+                "localhost:7419",
+                Some("test".to_string()),
+                Some(Uuid::new_v4().to_string()),
+            ),
+            256,
+        );
 
-        let random_queue = Uuid::new_v4().to_string();
-        let random_jid = Uuid::new_v4().to_string();
+        let queue = Uuid::new_v4().to_string();
+        let fetch_result = client.fetch(&[queue.clone()]).await;
+        assert!(fetch_result.is_ok());
+        assert!(fetch_result.unwrap().is_none());
 
-        assert!(client
-            .fetch(&["it_consumes".to_owned()])
-            .await
-            .expect("fetch failed")
-            .is_none());
-
-        client
-            .push(Job {
-                jid: random_jid.clone(),
-                kind: "def".to_owned(),
-                queue: Some(random_queue.clone()),
-                args: Vec::new(),
-                ..Default::default()
-            })
-            .await
-            .expect("fetch failed");
-
-        assert_eq!(
+        for _ in 0..5 {
             client
-                .fetch(&[random_queue.clone()])
+                .push(Job {
+                    jid: Uuid::new_v4().to_string(),
+                    kind: "def".to_owned(),
+                    queue: Some(queue.clone()),
+                    args: Vec::new(),
+                    ..Default::default()
+                })
                 .await
-                .expect("fetch failed")
-                .expect("got no job")
-                .jid,
-            random_jid
-        );
+                .expect("push failed");
+        }
 
-        assert!(client
-            .fetch(&["it_consumes".to_owned()])
-            .await
-            .expect("fetch failed")
-            .is_none());
+        let mut jobs = vec![];
+        while let Ok(Some(job)) = client.fetch(&[queue.clone()]).await {
+            jobs.push(job.clone());
+            client.ack(job.id().to_string()).await.expect("could not ack");
+        }
 
-        client.ack(random_jid.clone()).await.expect("ack failed");
-        //assert!(client.ack(random_jid.clone()).await.is_err());
-        assert!(client
-            .fail(FailConfig::new(
-                random_jid.clone(),
-                "my msg".to_owned(),
-                "my-err-kind".to_owned(),
-                None
-            ))
-            .await
-            .is_err());
-    }
+        assert_eq!(5, jobs.len());
 
-    #[tokio::test]
-    async fn it_consumes_fail() {
-        let client = Client::new(&Config::from_uri("localhost:7419"))
-            .await
-            .expect("unable to connect to faktory");
-
-        let random_queue = Uuid::new_v4().to_string();
-        let random_jid = Uuid::new_v4().to_string();
-
-        assert!(client
-            .fetch(&["it_consumes".to_owned()])
-            .await
-            .expect("fetch failed")
-            .is_none());
-
-        client
-            .push(Job {
-                jid: random_jid.clone(),
-                kind: "def".to_owned(),
-                queue: Some(random_queue.clone()),
-                args: Vec::new(),
-                ..Default::default()
-            })
-            .await
-            .expect("fetch failed");
-
-        assert_eq!(
-            client
-                .fetch(&[random_queue.clone()])
-                .await
-                .expect("fetch failed")
-                .expect("got no job")
-                .jid,
-            random_jid
-        );
-
-        assert!(client
-            .fetch(&["it_consumes".to_owned()])
-            .await
-            .expect("fetch failed")
-            .is_none());
-
-        client
-            .fail(FailConfig::new(
-                random_jid.clone(),
-                "my msg".to_owned(),
-                "my-err-kind".to_owned(),
-                None,
-            ))
-            .await
-            .expect("unable to fail job");
-        assert!(client
-            .fail(FailConfig::new(
-                random_jid.clone(),
-                "my msg".to_owned(),
-                "my-err-kind".to_owned(),
-                None
-            ))
-            .await
-            .is_err());
-        //assert!(client.ack(random_jid.clone()).await.is_err());
-
-        //tokio::time::sleep(Duration::from_secs(40)).await;
-
-        //assert_eq!(
-        //    client
-        //        .fetch(&[random_queue.clone()])
-        //        .await
-        //        .expect("fetch failed")
-        //        .expect("got no job")
-        //        .jid,
-        //    random_jid
-        //);
-        //client.ack(random_jid.clone()).await.expect("ack failed");
-    }
-
-    #[tokio::test]
-    async fn it_produces() {
-        let client = Client::new(&Config::from_uri("localhost:7419"))
-            .await
-            .expect("unable to connect to faktory");
-        let random_jid = Uuid::new_v4().to_string();
-
-        client
-            .push(Job {
-                jid: random_jid.clone(),
-                queue: Some("it_produces".to_owned()),
-                kind: "def".to_owned(),
-                args: Vec::new(),
-                ..Default::default()
-            })
-            .await
-            .expect("push failed");
-    }
-
-    #[tokio::test]
-    async fn it_doesnt_disconnect_twice() {
-        let client = Client::new(&Config::from_uri("localhost:7419"))
-            .await
-            .expect("unable to connect to faktory");
-
-        assert!(client.clone().close().await.is_ok());
-        assert!(client.close().await.is_err());
-        //assert_eq!(client.close().await, Err(FaktoryError::ConnectionAlreadyClosed));
-    }
-
-    #[tokio::test]
-    async fn it_beats() {
-        let mut config = Config::from_uri("localhost:7419");
-        config.does_consume();
-
-        let client = Client::new(&config)
-            .await
-            .expect("unable to connect to faktory");
-
-        assert_eq!(client.beat().await.expect("unable to beat"), BeatState::Ok);
-        assert_eq!(
-            client.last_beat().await.expect("unable to get last beat"),
-            BeatState::Ok
-        );
-        assert_eq!(client.beat().await.expect("unable to beat"), BeatState::Ok);
-        assert_eq!(
-            client.last_beat().await.expect("unable to get last beat"),
-            BeatState::Ok
-        );
-        assert_eq!(client.beat().await.expect("unable to beat"), BeatState::Ok);
-        assert_eq!(
-            client.last_beat().await.expect("unable to get last beat"),
-            BeatState::Ok
-        );
-        assert_eq!(client.beat().await.expect("unable to beat"), BeatState::Ok);
+        let _ = client.end().await;
     }
 }
