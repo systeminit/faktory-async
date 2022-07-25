@@ -252,7 +252,6 @@ impl Client {
                         }
                         Err(err) => {
                             response.send(FaktoryResponse::Error(err)).unwrap();
-                            break;
                         }
                     },
                     FaktoryCommand::BatchCommit(batch_id) => {
@@ -281,7 +280,6 @@ impl Client {
                         }
                         Err(err) => {
                             response.send(FaktoryResponse::Error(err)).unwrap();
-                            break;
                         }
                     },
                     // The end command will close this connection. It attemps to send "End" to the
@@ -310,7 +308,6 @@ impl Client {
                         }
                         Err(err) => {
                             response.send(FaktoryResponse::Error(err)).unwrap();
-                            break;
                         }
                     },
                     FaktoryCommand::Fail(fail_config) => match connection.fail(fail_config).await {
@@ -319,7 +316,6 @@ impl Client {
                         }
                         Err(err) => {
                             response.send(FaktoryResponse::Error(err)).unwrap();
-                            break;
                         }
                     },
                     FaktoryCommand::GetLastBeat => {
@@ -334,7 +330,6 @@ impl Client {
                         Err(err) => {
                             // info!("Error pushing job to faktory: {err}");
                             response.send(FaktoryResponse::Error(err)).unwrap();
-                            break;
                         }
                     },
                 }
