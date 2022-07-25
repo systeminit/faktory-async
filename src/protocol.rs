@@ -14,7 +14,7 @@ pub enum BeatState {
     Terminate,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct FailConfig {
     jid: String,
     message: String,
@@ -53,7 +53,7 @@ pub struct BatchConfig {
 }
 
 #[derive(Serialize)]
-pub(crate) struct HelloConfig {
+pub struct HelloConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

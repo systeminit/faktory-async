@@ -4,54 +4,47 @@ use crate::{Config, Error, Job, Result};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-use uuid::Uuid;
 
 #[derive(Debug)]
 pub(crate) struct Connection {
     config: Config,
-    wid: Option<String>,
     reader: BufReader<OwnedReadHalf>,
     writer: OwnedWriteHalf,
     last_beat: BeatState,
-    inside_rw: bool,
-    retries: usize,
 }
 
 impl Connection {
     pub async fn new(config: Config) -> Result<Self> {
         let (reader, writer) = TcpStream::connect(&config.uri).await?.into_split();
-        let wid = if config.does_consume {
-            Some(Uuid::new_v4().to_string())
-        } else {
-            None
-        };
         let mut conn = Connection {
             config,
-            wid: wid.clone(),
             reader: BufReader::new(reader),
             writer,
             last_beat: BeatState::Ok,
-            inside_rw: false,
-            retries: 0,
         };
         // TODO: properly parse the HI response
         conn.validate_response("HI {\"v\":2}").await?;
+        conn.default_hello().await?;
 
+        Ok(conn)
+    }
+
+    pub async fn default_hello(&mut self) -> Result<()> {
         // TODO: improve hello config usage
         let mut config = HelloConfig::default();
         config.pid = Some(std::process::id() as usize);
         config.labels = vec!["faktory-async-rust".to_owned()];
-        config.wid = wid;
-        conn.hello(config).await?;
+        config.wid = self.config.worker_id.clone();
+        self.hello(config).await?;
 
-        Ok(conn)
+        Ok(())
     }
 
     pub fn last_beat(&self) -> BeatState {
         self.last_beat
     }
 
-    pub async fn close(&mut self) -> Result<()> {
+    pub async fn end(&mut self) -> Result<()> {
         self.send_command("END", vec![]).await?;
         Ok(())
     }
@@ -62,7 +55,7 @@ impl Connection {
         self.send_command(
             "BEAT",
             vec![serde_json::to_string(
-                &serde_json::json!({ "wid": self.wid }),
+                &serde_json::json!({ "wid": self.config.worker_id }),
             )?],
         )
         .await?;
@@ -72,7 +65,7 @@ impl Connection {
                 Ok(BeatState::Ok)
             }
             Some(output) => {
-                self.last_beat = serde_json::from_str::<BeatReply>(&output)?.state;
+                self.last_beat = serde_json::from_str::<BeatReply>(output)?.state;
                 Ok(self.last_beat)
             }
             None => Err(Error::ReceivedEmptyMessage),
@@ -123,13 +116,10 @@ impl Connection {
         Ok(())
     }
 
-    pub async fn batch_create(&mut self, config: BatchConfig) -> Result<String> {
+    pub async fn batch_new(&mut self, config: BatchConfig) -> Result<String> {
         self.send_command("BATCH NEW", vec![serde_json::to_string(&config)?])
             .await?;
-        Ok(self
-            .read_string()
-            .await?
-            .ok_or(Error::ReceivedEmptyMessage)?)
+        self.read_string().await?.ok_or(Error::ReceivedEmptyMessage)
     }
 
     pub async fn batch_commit(&mut self, bid: String) -> Result<()> {
@@ -138,88 +128,50 @@ impl Connection {
         Ok(())
     }
 
-    #[async_recursion::async_recursion]
     async fn send_command(&mut self, key: &'static str, args: Vec<String>) -> Result<()> {
         let mut args = vec![key.into(), args.into_iter().collect::<Vec<_>>().join(" ")].join(" ");
         args.push_str("\r\n");
-
-        let was_inside_rw = std::mem::replace(&mut self.inside_rw, true);
-        while let Err(err) = self.writer.write_all(dbg!(&args).as_bytes()).await {
-            let _ = self.close().await;
-            *self = match Self::new(self.config.clone()).await {
-                Ok(c) => c,
-                err @ Err(Error::ReceivedErrorMessage(_, _)) => return err.map(|_| ()),
-                Err(_) => {
-                    if self.retries > 5 {
-                        return Err(err)?;
-                    }
-
-                    self.retries += 1;
-                    continue;
-                }
-            }
-        }
-        if !was_inside_rw {
-            self.retries = 0;
-        }
-
+        self.writer.write_all(dbg!(&args).as_bytes()).await?;
         Ok(())
     }
 
-    #[async_recursion::async_recursion]
     async fn read_string(&mut self) -> Result<Option<String>> {
-        loop {
-            match read_string_fallible(self).await {
-                Ok(msg) => return Ok(msg),
-                err @ Err(Error::ReceivedErrorMessage(_, _)) => return err,
-                Err(err) => {
-                    *self = match Self::new(self.config.clone()).await {
-                        Ok(c) => c,
-                        Err(_) => return Err(err),
-                    }
-                }
-            }
+        let mut output = String::new();
+        self.reader.read_line(&mut output).await?;
+
+        if dbg!(&output).is_empty() {
+            return Err(Error::ReceivedEmptyMessage);
+        }
+        if !output.ends_with("\r\n") {
+            return Err(Error::MissingCarriageReturn);
         }
 
-        async fn read_string_fallible(conn: &mut Connection) -> Result<Option<String>> {
-            let mut output = String::new();
-            conn.reader.read_line(&mut output).await?;
-
-            if dbg!(&output).is_empty() {
-                return Err(Error::ReceivedEmptyMessage);
-            }
-            if !output.ends_with("\r\n") {
-                return Err(Error::MissingCarriageReturn);
-            }
-
-            match output.remove(0) {
-                '$' => {
-                    if output == "-1\r\n" {
-                        return Ok(None);
-                    }
-
-                    let len: usize = output[0..output.len() - 2].parse()?;
-                    let mut output = vec![0; len];
-                    conn.reader.read_exact(&mut output).await?;
-                    //conn.reader.read_line(&mut String::new())?;
-                    conn.reader.read_exact(&mut [0; 2]).await?;
-                    Ok(Some(String::from_utf8(output)?))
+        match output.remove(0) {
+            '$' => {
+                if output == "-1\r\n" {
+                    return Ok(None);
                 }
-                '+' => {
-                    output.truncate(output.len() - 2);
-                    Ok(Some(output))
-                }
-                '-' => {
-                    let (kind, msg) = output
-                        .split_once(" ")
-                        .ok_or_else(|| Error::ReceivedInvalidErrorMessage(output.clone()))?;
-                    Err(Error::ReceivedErrorMessage(
-                        kind.to_owned(),
-                        msg[..msg.len() - 2].to_owned(),
-                    ))
-                }
-                prefix => Err(Error::InvalidMessagePrefix(format!("{prefix}{output}"))),
+
+                let len: usize = output[0..output.len() - 2].parse()?;
+                let mut output = vec![0; len];
+                self.reader.read_exact(&mut output).await?;
+                self.reader.read_exact(&mut [0; 2]).await?;
+                Ok(Some(String::from_utf8(output)?))
             }
+            '+' => {
+                output.truncate(output.len() - 2);
+                Ok(Some(output))
+            }
+            '-' => {
+                let (kind, msg) = output
+                    .split_once(' ')
+                    .ok_or_else(|| Error::ReceivedInvalidErrorMessage(output.clone()))?;
+                Err(Error::ReceivedErrorMessage(
+                    kind.to_owned(),
+                    msg[..msg.len() - 2].to_owned(),
+                ))
+            }
+            prefix => Err(Error::InvalidMessagePrefix(format!("{prefix}{output}"))),
         }
     }
 
@@ -232,5 +184,173 @@ impl Connection {
             return Err(Error::UnexpectedResponse(output, expected.to_owned()))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn it_consumes_ack() {
+        let mut conn = Connection::new(Config::from_uri("localhost:7419", None, None))
+            .await
+            .expect("unable to connect to faktory");
+
+        let random_queue = Uuid::new_v4().to_string();
+        let random_jid = Uuid::new_v4().to_string();
+
+        assert!(conn
+            .fetch(&["it_consumes".to_owned()])
+            .await
+            .expect("fetch failed")
+            .is_none());
+
+        conn.push(Job {
+            jid: random_jid.clone(),
+            kind: "def".to_owned(),
+            queue: Some(random_queue.clone()),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("push failed");
+
+        assert_eq!(
+            conn.fetch(&[random_queue.clone()])
+                .await
+                .expect("fetch failed")
+                .expect("got no job")
+                .jid,
+            random_jid
+        );
+
+        assert!(conn
+            .fetch(&["it_consumes".to_owned()])
+            .await
+            .expect("fetch failed")
+            .is_none());
+
+        conn.ack(random_jid.clone()).await.expect("ack failed");
+        //assert!(client.ack(random_jid.clone()).await.is_err());
+        assert!(conn
+            .fail(FailConfig::new(
+                random_jid.clone(),
+                "my msg".to_owned(),
+                "my-err-kind".to_owned(),
+                None
+            ))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn it_consumes_fail() {
+        let mut conn = Connection::new(Config::from_uri("localhost:7419", None, None))
+            .await
+            .expect("unable to connect to faktory");
+
+        let random_queue = Uuid::new_v4().to_string();
+        let random_jid = Uuid::new_v4().to_string();
+
+        assert!(conn
+            .fetch(&["it_consumes".to_owned()])
+            .await
+            .expect("fetch failed")
+            .is_none());
+
+        conn.push(Job {
+            jid: random_jid.clone(),
+            kind: "def".to_owned(),
+            queue: Some(random_queue.clone()),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("fetch failed");
+
+        assert_eq!(
+            conn.fetch(&[random_queue.clone()])
+                .await
+                .expect("fetch failed")
+                .expect("got no job")
+                .jid,
+            random_jid
+        );
+
+        assert!(conn
+            .fetch(&["it_consumes".to_owned()])
+            .await
+            .expect("fetch failed")
+            .is_none());
+
+        conn.fail(FailConfig::new(
+            random_jid.clone(),
+            "my msg".to_owned(),
+            "my-err-kind".to_owned(),
+            None,
+        ))
+        .await
+        .expect("unable to fail job");
+        assert!(conn
+            .fail(FailConfig::new(
+                random_jid.clone(),
+                "my msg".to_owned(),
+                "my-err-kind".to_owned(),
+                None
+            ))
+            .await
+            .is_err());
+        //assert!(client.ack(random_jid.clone()).await.is_err());
+
+        //tokio::time::sleep(Duration::from_secs(40)).await;
+
+        //assert_eq!(
+        //    client
+        //        .fetch(&[random_queue.clone()])
+        //        .await
+        //        .expect("fetch failed")
+        //        .expect("got no job")
+        //        .jid,
+        //    random_jid
+        //);
+        //client.ack(random_jid.clone()).await.expect("ack failed");
+    }
+
+    #[tokio::test]
+    async fn it_produces() {
+        let mut conn = Connection::new(Config::from_uri("localhost:7419", None, None))
+            .await
+            .expect("unable to connect to faktory");
+        let random_jid = Uuid::new_v4().to_string();
+
+        conn.push(Job {
+            jid: random_jid.clone(),
+            queue: Some("it_produces".to_owned()),
+            kind: "def".to_owned(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("push failed");
+    }
+
+    #[tokio::test]
+    async fn it_beats() {
+        let mut config = Config::from_uri("localhost:7419", None, None);
+        config.worker_id = Some(Uuid::new_v4().to_string());
+
+        let mut conn = Connection::new(config)
+            .await
+            .expect("unable to connect to faktory");
+
+        assert_eq!(conn.beat().await.expect("unable to beat"), BeatState::Ok);
+        assert_eq!(conn.last_beat(), BeatState::Ok);
+        assert_eq!(conn.beat().await.expect("unable to beat"), BeatState::Ok);
+        assert_eq!(conn.last_beat(), BeatState::Ok);
+        assert_eq!(conn.beat().await.expect("unable to beat"), BeatState::Ok);
+        assert_eq!(conn.last_beat(), BeatState::Ok);
+        assert_eq!(conn.beat().await.expect("unable to beat"), BeatState::Ok);
     }
 }
