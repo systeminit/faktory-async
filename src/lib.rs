@@ -1,4 +1,4 @@
-mod error;
+pub mod error;
 
 pub use faktory_lib_async::{Job, Config, BatchConfig, BeatState, FailConfig, Connection};
 
