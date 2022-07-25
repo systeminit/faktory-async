@@ -1,6 +1,8 @@
 // TODO: have our own error type
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+use crate::FaktoryCommandMessage;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
@@ -11,6 +13,12 @@ pub enum Error {
     ParseInt(#[from] std::num::ParseIntError),
     #[error(transparent)]
     FromUtf8(#[from] std::string::FromUtf8Error),
+    #[error(transparent)]
+    ReceiveResponse(#[from] tokio::sync::oneshot::error::RecvError),
+    #[error(transparent)]
+    SendCommand(#[from] tokio::sync::mpsc::error::SendError<FaktoryCommandMessage>),
+    #[error(transparent)]
+    BroadcastTryReceive(#[from] tokio::sync::broadcast::error::TryRecvError),
 
     #[error("unexpected response: got {0}, expected {1}")]
     UnexpectedResponse(String, String),
