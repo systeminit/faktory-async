@@ -247,19 +247,20 @@ impl Client {
         config: &Config,
         mut shutdown_channel: broadcast::Receiver<()>,
     ) -> Option<Connection> {
-        let mut retries = 0;
+        let mut backoff = 0;
         loop {
-            if retries < 5 {
-                retries += 1;
-            }
             if shutdown_channel.try_recv().is_ok() {
                 break;
             }
             match Connection::new(config.clone()).await {
                 Err(_) => {
-                    tokio::time::sleep(Duration::from_secs(1 << retries)).await;
+                    tokio::time::sleep(Duration::from_secs(1 << backoff)).await;
                 }
                 Ok(connection) => return Some(connection),
+            }
+
+            if backoff < 5 {
+                backoff += 1;
             }
         }
 
