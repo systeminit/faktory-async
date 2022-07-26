@@ -1,5 +1,5 @@
-use faktory_lib_async::Error as FaktoryLibAsyncError;
 use crate::FaktoryCommandMessage;
+use faktory_lib_async::Error as FaktoryLibAsyncError;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -17,5 +17,6 @@ pub enum Error {
     SendCommand(#[from] tokio::sync::mpsc::error::SendError<FaktoryCommandMessage>),
     #[error(transparent)]
     BroadcastTryReceive(#[from] tokio::sync::broadcast::error::TryRecvError),
-} 
-
+    #[error(transparent)]
+    BroadcastSend(#[from] tokio::sync::broadcast::error::SendError<()>),
+}
