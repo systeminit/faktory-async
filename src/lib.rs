@@ -249,8 +249,9 @@ impl Client {
     ) -> Option<Connection> {
         let mut backoff = 0;
         loop {
-            if shutdown_channel.try_recv().is_ok() {
-                break;
+            match shutdown_channel.try_recv() {
+                Err(broadcast::error::TryRecvError::Empty) => {},
+                _ => break
             }
             match Connection::new(config.clone()).await {
                 Err(_) => {
@@ -326,15 +327,7 @@ impl Client {
         let clone = self.clone();
         tokio::task::spawn(async move {
             loop {
-                if let Ok(beat_state) = clone.beat().await {
-                    match beat_state {
-                        BeatState::Ok => {}
-                        // Both the Quiet and Terminate states from the
-                        // faktory server mean that we should initiate a
-                        // shutdown. So don't send an additional beat.
-                        BeatState::Quiet | BeatState::Terminate => break,
-                    }
-                }
+                let _ = clone.beat().await;
 
                 tokio::select! {
                     _ = beat_shutdown_channel.recv() => {
