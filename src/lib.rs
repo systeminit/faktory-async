@@ -7,16 +7,16 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 #[derive(Debug)]
-pub enum FaktoryResponse {
+enum FaktoryResponse {
     Beat(BeatState),
-    Error(Error),
-    Retry,
+    Error(String, String),
     Job(Option<Box<Job>>),
+    BatchId(String),
     Ok,
 }
 
 #[derive(Debug)]
-pub enum FaktoryCommand {
+enum FaktoryCommand {
     Ack(String),
     BatchCommit(String),
     BatchNew(Box<BatchConfig>),
@@ -27,46 +27,35 @@ pub enum FaktoryCommand {
     Push(Box<Job>),
 }
 
-pub type FaktoryCommandMessage = (FaktoryCommand, oneshot::Sender<FaktoryResponse>);
-pub type FaktoryCommandSender = mpsc::Sender<FaktoryCommandMessage>;
-pub type FaktoryCommandReceiver = mpsc::Receiver<FaktoryCommandMessage>;
+type FaktoryCommandMessage = (FaktoryCommand, oneshot::Sender<FaktoryResponse>);
+type FaktoryCommandSender = mpsc::Sender<FaktoryCommandMessage>;
+type FaktoryCommandReceiver = mpsc::Receiver<FaktoryCommandMessage>;
 
 #[derive(Debug, Clone)]
 pub struct Client {
     config: Config,
     command_sender: FaktoryCommandSender,
-    beat_shutdown_sender: Option<broadcast::Sender<()>>,
     shutdown_sender: broadcast::Sender<()>,
 }
 
-enum CommandOutcome {
-    Reconnect,
-    Ok,
-}
-
 impl Client {
-    pub fn new(config: &Config, channel_size: usize) -> Self {
+    pub fn new(config: Config, channel_size: usize) -> Self {
         let (command_sender, command_receiver) =
             mpsc::channel::<FaktoryCommandMessage>(channel_size);
 
-        let (beat_shutdown_sender, beat_shutdown_channel) = broadcast::channel(1);
         let (shutdown_sender, shutdown_channel) = broadcast::channel(1);
 
+        let has_wid = config.worker_id.is_some();
         let client = Self {
-            config: config.clone(),
+            config,
             command_sender,
-            beat_shutdown_sender: if config.worker_id.is_some() {
-                Some(beat_shutdown_sender)
-            } else {
-                None
-            },
             shutdown_sender,
         };
 
         client.spawn_faktory_connection(command_receiver, shutdown_channel.resubscribe());
 
-        if config.worker_id.is_some() {
-            client.spawn_heartbeat(beat_shutdown_channel, shutdown_channel.resubscribe());
+        if has_wid {
+            client.spawn_heartbeat(shutdown_channel);
         }
 
         client
@@ -149,12 +138,12 @@ impl Client {
         }
     }
 
-    pub async fn batch_new(&self, batch_config: BatchConfig) -> Result<()> {
+    pub async fn batch_new(&self, batch_config: BatchConfig) -> Result<String> {
         match self
             .send_command(FaktoryCommand::BatchNew(batch_config.into()))
             .await?
         {
-            FaktoryResponse::Ok => Ok(()),
+            FaktoryResponse::BatchId(bid) => Ok(bid),
             other => Err(Error::UnexpectedResponse(
                 format!("{:?}", other),
                 "FaktoryResponse::Ok".to_string(),
@@ -166,79 +155,94 @@ impl Client {
     /// beat task (if running). If we still have a connection to faktory, this will
     /// send the END command as well.
     pub fn close(&self) -> Result<()> {
-        self.shutdown_sender.send(())?;
+        // If the receiver isn't there, there is nothing to close
+        let _ = self.shutdown_sender.send(());
         Ok(())
     }
 
-    pub async fn send_command(&self, command: FaktoryCommand) -> Result<FaktoryResponse> {
+    async fn send_command(&self, command: FaktoryCommand) -> Result<FaktoryResponse> {
         let (response_sender, response_receiver) = oneshot::channel();
 
-        self.command_sender.send((command, response_sender)).await?;
+        self.command_sender
+            .send((command, response_sender))
+            .await
+            .map_err(|_| Error::SendCommand)?;
         match response_receiver.await? {
-            FaktoryResponse::Error(err) => Err(err),
+            FaktoryResponse::Error(kind, msg) => Err(Error::Faktory(kind, msg)),
             other => Ok(other),
         }
     }
 
-    async fn handle_msg(msg: FaktoryCommandMessage, connection: &mut Connection) -> CommandOutcome {
+    async fn handle_msg(
+        msg: FaktoryCommandMessage,
+        connection: &mut Connection,
+        config: &Config,
+        shutdown_channel: &broadcast::Receiver<()>,
+    ) {
         let (cmd, responder) = msg;
 
-        match Client::handle_cmd(cmd, connection).await {
-            FaktoryResponse::Error(err) => match err {
-                Error::FaktoryLib(faktory_lib_async::Error::Io(_)) => {
-                    responder.send(FaktoryResponse::Retry).unwrap();
-                    CommandOutcome::Reconnect
+        loop {
+            match Client::handle_cmd(&cmd, connection).await {
+                // If the response receiver has gone away, it's because the caller killed it's tokio task
+                // That means faktory will still get the command, but the caller won't get the response
+                // So we can safely ignore channel failures here
+
+                Err(faktory_lib_async::Error::ReceivedErrorMessage(kind, msg)) => {
+                    let _ = responder.send(FaktoryResponse::Error(kind, msg));
+                    break;
                 }
-                _ => {
-                    responder.send(FaktoryResponse::Error(err)).unwrap();
-                    CommandOutcome::Ok
+                Ok(ok_response) => {
+                    let _ = responder.send(ok_response);
+                    break;
                 }
-            },
-            ok_response => {
-                responder.send(ok_response).unwrap();
-                CommandOutcome::Ok
+
+
+                Err(_err) => {
+                    // TODO: is there a case where retrying will keep failing because the user provided data
+                    // for this request caused an unexpected error? should we give up, or re-enqueue this
+                    // command at the end of the line?
+
+                    //error!("faktory_lib_async returned a critical error, reconnecting and trying to send the message again: {_err}");
+
+                    if let Some(conn) =
+                        Client::attempt_connect(config, shutdown_channel.resubscribe()).await
+                    {
+                        *connection = conn;
+                    }
+
+                    // If no connection was obtained handle_cmd will certainly fail and trigger this branch again
+                }
             }
         }
     }
 
-    async fn handle_cmd(cmd: FaktoryCommand, connection: &mut Connection) -> FaktoryResponse {
+    async fn handle_cmd(
+        cmd: &FaktoryCommand,
+        connection: &mut Connection,
+    ) -> faktory_lib_async::Result<FaktoryResponse> {
         match cmd {
-            FaktoryCommand::Ack(job_id) => match connection.ack(job_id).await {
-                Ok(_) => FaktoryResponse::Ok,
-                Err(err) => FaktoryResponse::Error(err.into()),
-            },
-            FaktoryCommand::BatchCommit(batch_id) => {
-                match connection.batch_commit(batch_id).await {
-                    Ok(_) => FaktoryResponse::Ok,
-                    Err(err) => FaktoryResponse::Error(err.into()),
-                }
+            FaktoryCommand::Ack(job_id) => {
+                connection.ack(job_id).await.map(|()| FaktoryResponse::Ok)
             }
-            FaktoryCommand::BatchNew(batch_config) => {
-                match connection.batch_new(*batch_config).await {
-                    Ok(_) => FaktoryResponse::Ok,
-                    Err(err) => FaktoryResponse::Error(err.into()),
-                }
-            }
-            FaktoryCommand::Beat => match connection.beat().await {
-                Ok(beat_state) => FaktoryResponse::Beat(beat_state),
-                Err(err) => FaktoryResponse::Error(err.into()),
-            },
-            FaktoryCommand::Fetch(queues) => match connection.fetch(&queues).await {
-                Ok(job) => FaktoryResponse::Job(job.map(Into::into)),
-                Err(err) => FaktoryResponse::Error(err.into()),
-            },
-            FaktoryCommand::Fail(fail_config) => match connection.fail(fail_config).await {
-                Ok(_) => FaktoryResponse::Ok,
-                Err(err) => FaktoryResponse::Error(err.into()),
-            },
-            FaktoryCommand::GetLastBeat => FaktoryResponse::Beat(connection.last_beat()),
-            FaktoryCommand::Push(job) => match connection.push(*job).await {
-                Ok(_) => FaktoryResponse::Ok,
-                Err(err) => {
-                    // info!("Error pushing job to faktory: {err}");
-                    FaktoryResponse::Error(err.into())
-                }
-            },
+            FaktoryCommand::BatchCommit(batch_id) => connection
+                .batch_commit(batch_id)
+                .await
+                .map(|()| FaktoryResponse::Ok),
+            FaktoryCommand::BatchNew(batch_config) => connection
+                .batch_new(&*batch_config)
+                .await
+                .map(FaktoryResponse::BatchId),
+            FaktoryCommand::Beat => connection.beat().await.map(FaktoryResponse::Beat),
+            FaktoryCommand::Fetch(queues) => connection
+                .fetch(&queues.iter().map(|q| q.as_str()).collect::<Vec<_>>())
+                .await
+                .map(|job| FaktoryResponse::Job(job.map(Into::into))),
+            FaktoryCommand::Fail(fail_config) => connection
+                .fail(fail_config)
+                .await
+                .map(|()| FaktoryResponse::Ok),
+            FaktoryCommand::GetLastBeat => Ok(FaktoryResponse::Beat(connection.last_beat())),
+            FaktoryCommand::Push(job) => connection.push(&*job).await.map(|()| FaktoryResponse::Ok),
         }
     }
 
@@ -250,12 +254,16 @@ impl Client {
         let mut backoff = 0;
         loop {
             match shutdown_channel.try_recv() {
-                Err(broadcast::error::TryRecvError::Empty) => {},
-                _ => break
+                Err(broadcast::error::TryRecvError::Empty) => {}
+                _ => break,
             }
-            match Connection::new(config.clone()).await {
+
+            match dbg!(Connection::new(config.clone()).await) {
                 Err(_) => {
-                    tokio::time::sleep(Duration::from_secs(1 << backoff)).await;
+                    tokio::select! {
+                        _ = shutdown_channel.recv() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(1 << backoff)) => {}
+                    }
                 }
                 Ok(connection) => return Some(connection),
             }
@@ -275,40 +283,28 @@ impl Client {
         mut shutdown_channel: broadcast::Receiver<()>,
     ) {
         let config = self.config.clone();
-        let beat_shutdown_sender = self.beat_shutdown_sender.clone();
 
         tokio::task::spawn(async move {
             let mut connection =
                 Client::attempt_connect(&config, shutdown_channel.resubscribe()).await;
-            let mut last_command_outcome: CommandOutcome = CommandOutcome::Ok;
 
             loop {
-                match last_command_outcome {
-                    CommandOutcome::Reconnect => {
-                        connection =
-                            Client::attempt_connect(&config, shutdown_channel.resubscribe()).await;
-                    }
-                    CommandOutcome::Ok => {}
-                };
-
                 match connection {
-                    None => return,
+                    None => {
+                        let shutdown_channel2 = shutdown_channel.resubscribe();
+                        connection = tokio::select! {
+                            _ = shutdown_channel.recv() => break,
+                            conn = Client::attempt_connect(&config, shutdown_channel2) => conn,
+                        }
+                    }
                     Some(ref mut connection) => {
                         tokio::select! {
                             Some(msg) = command_receiver.recv() => {
-                                last_command_outcome = Client::handle_msg(
-                                        msg,
-                                        connection,
-                                    ).await;
+                                Client::handle_msg(msg, connection, &config, &shutdown_channel).await
                             }
                             _ = shutdown_channel.recv() => {
-                                if let Some(beat_shutdown_sender) = beat_shutdown_sender {
-                                    beat_shutdown_sender.send(()).unwrap();
-                                }
-
                                 let _ = connection.end().await;
-
-                                return;
+                                break;
                             }
                         }
                     }
@@ -319,23 +315,14 @@ impl Client {
 
     // If we're a worker, spawn a heartbeat task that sends a BEAT message to faktory every
     // ~15 seconds
-    fn spawn_heartbeat(
-        &self,
-        mut beat_shutdown_channel: broadcast::Receiver<()>,
-        mut shutdown_channel: broadcast::Receiver<()>,
-    ) {
+    fn spawn_heartbeat(&self, mut shutdown_channel: broadcast::Receiver<()>) {
         let clone = self.clone();
         tokio::task::spawn(async move {
             loop {
                 let _ = clone.beat().await;
 
                 tokio::select! {
-                    _ = beat_shutdown_channel.recv() => {
-                        break;
-                    }
-                    _ = shutdown_channel.recv() => {
-                        break
-                    }
+                    _ = shutdown_channel.recv() => break,
                     _ = tokio::time::sleep(Duration::from_secs(15)) => {}
                 }
             }
@@ -351,7 +338,7 @@ mod tests {
     #[tokio::test]
     async fn it_pushes_and_fetches_and_acks() {
         let client = Client::new(
-            &Config::from_uri(
+            Config::from_uri(
                 "localhost:7419",
                 Some("test".to_string()),
                 Some(Uuid::new_v4().to_string()),
@@ -398,7 +385,7 @@ mod tests {
     #[ignore]
     async fn it_handles_reconnection() {
         let client = Client::new(
-            &Config::from_uri(
+            Config::from_uri(
                 "localhost:7419",
                 Some("test".to_string()),
                 Some(Uuid::new_v4().to_string()),
@@ -408,8 +395,8 @@ mod tests {
 
         let queue = Uuid::new_v4().to_string();
 
-        loop {
-            let _ = dbg!(client.fetch(&[queue.clone()]).await);
+        while dbg!(client.fetch(&[queue.clone()]).await).is_err() {
+            println!("Retrying");
         }
     }
 
@@ -417,7 +404,7 @@ mod tests {
     #[ignore]
     async fn it_shuts_down() {
         let client = Client::new(
-            &Config::from_uri(
+            Config::from_uri(
                 "localhost:7419",
                 Some("test".to_string()),
                 Some(Uuid::new_v4().to_string()),
