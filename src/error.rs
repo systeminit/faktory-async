@@ -17,4 +17,6 @@ pub enum Error {
     SendCommand(#[from] tokio::sync::mpsc::error::SendError<FaktoryCommandMessage>),
     #[error(transparent)]
     BroadcastTryReceive(#[from] tokio::sync::broadcast::error::TryRecvError),
+    #[error(transparent)]
+    BroadcastSend(#[from] tokio::sync::broadcast::error::SendError<()>),
 }

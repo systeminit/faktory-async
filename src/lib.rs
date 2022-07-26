@@ -21,7 +21,6 @@ pub enum FaktoryCommand {
     BatchCommit(String),
     BatchNew(Box<BatchConfig>),
     Beat,
-    End,
     Fail(FailConfig),
     Fetch(Vec<String>),
     GetLastBeat,
@@ -37,10 +36,10 @@ pub struct Client {
     config: Config,
     command_sender: FaktoryCommandSender,
     beat_shutdown_sender: Option<broadcast::Sender<()>>,
+    shutdown_sender: broadcast::Sender<()>,
 }
 
 enum CommandOutcome {
-    Shutdown,
     Reconnect,
     Ok,
 }
@@ -51,6 +50,7 @@ impl Client {
             mpsc::channel::<FaktoryCommandMessage>(channel_size);
 
         let (beat_shutdown_sender, beat_shutdown_channel) = broadcast::channel(1);
+        let (shutdown_sender, shutdown_channel) = broadcast::channel(1);
 
         let client = Self {
             config: config.clone(),
@@ -60,12 +60,13 @@ impl Client {
             } else {
                 None
             },
+            shutdown_sender,
         };
 
-        client.spawn_faktory_connection(command_receiver);
+        client.spawn_faktory_connection(command_receiver, shutdown_channel.resubscribe());
 
         if config.worker_id.is_some() {
-            client.spawn_heartbeat(beat_shutdown_channel);
+            client.spawn_heartbeat(beat_shutdown_channel, shutdown_channel.resubscribe());
         }
 
         client
@@ -161,14 +162,12 @@ impl Client {
         }
     }
 
-    pub async fn end(&self) -> Result<()> {
-        match self.send_command(FaktoryCommand::End).await? {
-            FaktoryResponse::Ok => Ok(()),
-            other => Err(Error::UnexpectedResponse(
-                format!("{:?}", other),
-                "FaktoryResponse::Ok".to_string(),
-            )),
-        }
+    /// Close the Faktory client. Will shutdown the connection task as well as the
+    /// beat task (if running). If we still have a connection to faktory, this will
+    /// send the END command as well.
+    pub fn close(&self) -> Result<()> {
+        self.shutdown_sender.send(())?;
+        Ok(())
     }
 
     pub async fn send_command(&self, command: FaktoryCommand) -> Result<FaktoryResponse> {
@@ -181,34 +180,10 @@ impl Client {
         }
     }
 
-    async fn handle_msg(
-        msg: FaktoryCommandMessage,
-        connection: &mut Connection,
-        beat_shutdown_sender: Option<broadcast::Sender<()>>,
-    ) -> CommandOutcome {
+    async fn handle_msg(msg: FaktoryCommandMessage, connection: &mut Connection) -> CommandOutcome {
         let (cmd, responder) = msg;
 
-        let response = match cmd {
-            FaktoryCommand::End => {
-                match connection.end().await {
-                    Ok(_) => {
-                        responder.send(FaktoryResponse::Ok).unwrap();
-                    }
-                    Err(err) => {
-                        responder.send(FaktoryResponse::Error(err.into())).unwrap();
-                    }
-                };
-
-                if let Some(beat_shutdown_sender) = beat_shutdown_sender {
-                    let _ = beat_shutdown_sender.send(());
-                }
-
-                return CommandOutcome::Shutdown;
-            }
-            cmd => Client::handle_cmd(cmd, connection).await,
-        };
-
-        match response {
+        match Client::handle_cmd(cmd, connection).await {
             FaktoryResponse::Error(err) => match err {
                 Error::FaktoryLib(faktory_lib_async::Error::Io(_)) => {
                     responder.send(FaktoryResponse::Retry).unwrap();
@@ -264,15 +239,22 @@ impl Client {
                     FaktoryResponse::Error(err.into())
                 }
             },
-            // End is handled in handle_msg
-            _ => unimplemented!("this should not be reached"),
         }
     }
 
-    // Attempts to connect to faktory with exponential backoff
-    async fn attempt_connect(config: &Config) -> Option<Connection> {
-        // 14 retries is 2^14 = 16,384 seconds or 4.5 hours
-        for retries in 0..15 {
+    // Attempts to connect to faktory with exponential backoff. Largest sleep is 32 seconds
+    async fn attempt_connect(
+        config: &Config,
+        mut shutdown_channel: broadcast::Receiver<()>,
+    ) -> Option<Connection> {
+        let mut retries = 0;
+        loop {
+            if retries < 5 {
+                retries += 1;
+            }
+            if shutdown_channel.try_recv().is_ok() {
+                break;
+            }
             match Connection::new(config.clone()).await {
                 Err(_) => {
                     tokio::time::sleep(Duration::from_secs(1 << retries)).await;
@@ -285,27 +267,49 @@ impl Client {
     }
 
     // Spawns a task that owns our connection to the faktory server
-    // Right now we panic if it takes 4 hours to get a connection
-    fn spawn_faktory_connection(&self, mut command_receiver: FaktoryCommandReceiver) {
+    fn spawn_faktory_connection(
+        &self,
+        mut command_receiver: FaktoryCommandReceiver,
+        mut shutdown_channel: broadcast::Receiver<()>,
+    ) {
         let config = self.config.clone();
         let beat_shutdown_sender = self.beat_shutdown_sender.clone();
+
         tokio::task::spawn(async move {
-            let mut connection = Client::attempt_connect(&config).await.unwrap();
+            let mut connection =
+                Client::attempt_connect(&config, shutdown_channel.resubscribe()).await;
             let mut last_command_outcome: CommandOutcome = CommandOutcome::Ok;
 
             loop {
                 match last_command_outcome {
-                    CommandOutcome::Shutdown => return,
                     CommandOutcome::Reconnect => {
-                        connection = Client::attempt_connect(&config).await.unwrap();
+                        connection =
+                            Client::attempt_connect(&config, shutdown_channel.resubscribe()).await;
                     }
                     CommandOutcome::Ok => {}
                 };
 
-                if let Some(msg) = command_receiver.recv().await {
-                    last_command_outcome =
-                        Client::handle_msg(msg, &mut connection, beat_shutdown_sender.clone())
-                            .await;
+                match connection {
+                    None => return,
+                    Some(ref mut connection) => {
+                        tokio::select! {
+                            Some(msg) = command_receiver.recv() => {
+                                last_command_outcome = Client::handle_msg(
+                                        msg,
+                                        connection,
+                                    ).await;
+                            }
+                            _ = shutdown_channel.recv() => {
+                                if let Some(beat_shutdown_sender) = beat_shutdown_sender {
+                                    beat_shutdown_sender.send(()).unwrap();
+                                }
+
+                                let _ = connection.end().await;
+
+                                return;
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -313,7 +317,11 @@ impl Client {
 
     // If we're a worker, spawn a heartbeat task that sends a BEAT message to faktory every
     // ~15 seconds
-    fn spawn_heartbeat(&self, mut beat_shutdown_channel: broadcast::Receiver<()>) {
+    fn spawn_heartbeat(
+        &self,
+        mut beat_shutdown_channel: broadcast::Receiver<()>,
+        mut shutdown_channel: broadcast::Receiver<()>,
+    ) {
         let clone = self.clone();
         tokio::task::spawn(async move {
             loop {
@@ -330,6 +338,9 @@ impl Client {
                 tokio::select! {
                     _ = beat_shutdown_channel.recv() => {
                         break;
+                    }
+                    _ = shutdown_channel.recv() => {
+                        break
                     }
                     _ = tokio::time::sleep(Duration::from_secs(15)) => {}
                 }
@@ -383,7 +394,7 @@ mod tests {
 
         assert_eq!(5, jobs.len());
 
-        let _ = client.end().await;
+        let _ = client.close();
     }
 
     // To use this test, you'll want to start it with faktory down, start faktory, then
@@ -391,7 +402,7 @@ mod tests {
     // runs in an infinite loop
     #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
     #[ignore]
-    async fn it_handles_disconnects() {
+    async fn it_handles_reconnection() {
         let client = Client::new(
             &Config::from_uri(
                 "localhost:7419",
@@ -406,5 +417,24 @@ mod tests {
         loop {
             let _ = dbg!(client.fetch(&[queue.clone()]).await);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+    #[ignore]
+    async fn it_shuts_down() {
+        let client = Client::new(
+            &Config::from_uri(
+                "localhost:7419",
+                Some("test".to_string()),
+                Some(Uuid::new_v4().to_string()),
+            ),
+            256,
+        );
+
+        tokio::time::sleep(Duration::from_secs(16)).await;
+
+        client.close().expect("able to close connection");
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
     }
 }
