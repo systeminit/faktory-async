@@ -1,16 +1,16 @@
-pub mod error;
+mod error;
 
-pub use faktory_lib_async::{Job, Config, BatchConfig, BeatState, FailConfig, Connection};
+pub use crate::error::{Error, Result};
+pub use faktory_lib_async::{BatchConfig, BeatState, Config, Connection, FailConfig, Job};
 
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
-
-use crate::error::{Result, Error};
 
 #[derive(Debug)]
 pub enum FaktoryResponse {
     Beat(BeatState),
     Error(Error),
+    Retry,
     Job(Option<Box<Job>>),
     Ok,
 }
@@ -37,6 +37,12 @@ pub struct Client {
     config: Config,
     command_sender: FaktoryCommandSender,
     beat_shutdown_sender: Option<broadcast::Sender<()>>,
+}
+
+enum CommandOutcome {
+    Shutdown,
+    Reconnect,
+    Ok,
 }
 
 impl Client {
@@ -120,10 +126,7 @@ impl Client {
     }
 
     pub async fn push(&self, job: Job) -> Result<()> {
-        match self
-            .send_command(FaktoryCommand::Push(job.into()))
-            .await?
-        {
+        match self.send_command(FaktoryCommand::Push(job.into())).await? {
             FaktoryResponse::Ok => Ok(()),
             other => Err(Error::UnexpectedResponse(
                 format!("{:?}", other),
@@ -178,109 +181,131 @@ impl Client {
         }
     }
 
-    // Spawns a task that owns our connection to the faktory server
-    fn spawn_faktory_connection(&self, mut command_receiver: FaktoryCommandReceiver) {
-        let config = self.config.clone();
-        let beat_shutdown_sender = self.beat_shutdown_sender.clone();
-        tokio::task::spawn(async move {
-            let connection = Connection::new(config.clone()).await;
-            if connection.is_err() {
+    async fn handle_msg(
+        msg: FaktoryCommandMessage,
+        connection: &mut Connection,
+        beat_shutdown_sender: Option<broadcast::Sender<()>>,
+    ) -> CommandOutcome {
+        let (cmd, responder) = msg;
+
+        let response = match cmd {
+            FaktoryCommand::End => {
+                match connection.end().await {
+                    Ok(_) => {
+                        responder.send(FaktoryResponse::Ok).unwrap();
+                    }
+                    Err(err) => {
+                        responder.send(FaktoryResponse::Error(err.into())).unwrap();
+                    }
+                };
+
                 if let Some(beat_shutdown_sender) = beat_shutdown_sender {
                     let _ = beat_shutdown_sender.send(());
                 }
 
-                return;
+                return CommandOutcome::Shutdown;
             }
+            cmd => Client::handle_cmd(cmd, connection).await,
+        };
 
-            let mut connection = connection.unwrap();
-            while let Some((cmd, response)) = command_receiver.recv().await {
-                match cmd {
-                    FaktoryCommand::Ack(job_id) => match connection.ack(job_id).await {
-                        Ok(_) => {
-                            response.send(FaktoryResponse::Ok).unwrap();
-                        }
-                        Err(err) => {
-                            response.send(FaktoryResponse::Error(err.into())).unwrap();
-                        }
-                    },
-                    FaktoryCommand::BatchCommit(batch_id) => {
-                        match connection.batch_commit(batch_id).await {
-                            Ok(_) => {
-                                response.send(FaktoryResponse::Ok).unwrap();
-                            }
-                            Err(err) => {
-                                response.send(FaktoryResponse::Error(err.into())).unwrap();
-                            }
-                        }
-                    }
-                    FaktoryCommand::BatchNew(batch_config) => {
-                        match connection.batch_new(*batch_config).await {
-                            Ok(_) => {
-                                response.send(FaktoryResponse::Ok).unwrap();
-                            }
-                            Err(err) => {
-                                response.send(FaktoryResponse::Error(err.into())).unwrap();
-                            }
-                        }
-                    }
-                    FaktoryCommand::Beat => match connection.beat().await {
-                        Ok(beat_state) => {
-                            response.send(FaktoryResponse::Beat(beat_state)).unwrap();
-                        }
-                        Err(err) => {
-                            response.send(FaktoryResponse::Error(err.into())).unwrap();
-                        }
-                    },
-                    // The end command will close this connection. It attemps to send "End" to the
-                    // server, but will not fail even if that fails (because the server has gone away,
-                    // for example)
-                    FaktoryCommand::End => {
-                        match connection.end().await {
-                            Ok(_) => {
-                                response.send(FaktoryResponse::Ok).unwrap();
-                            }
-                            Err(err) => {
-                                response.send(FaktoryResponse::Error(err.into())).unwrap();
-                            }
-                        }
+        match response {
+            FaktoryResponse::Error(err) => match err {
+                Error::FaktoryLib(faktory_lib_async::Error::Io(_)) => {
+                    responder.send(FaktoryResponse::Retry).unwrap();
+                    CommandOutcome::Reconnect
+                }
+                _ => {
+                    responder.send(FaktoryResponse::Error(err)).unwrap();
+                    CommandOutcome::Ok
+                }
+            },
+            ok_response => {
+                responder.send(ok_response).unwrap();
+                CommandOutcome::Ok
+            }
+        }
+    }
 
-                        if let Some(beat_shutdown_sender) = beat_shutdown_sender {
-                            let _ = beat_shutdown_sender.send(());
-                        }
+    async fn handle_cmd(cmd: FaktoryCommand, connection: &mut Connection) -> FaktoryResponse {
+        match cmd {
+            FaktoryCommand::Ack(job_id) => match connection.ack(job_id).await {
+                Ok(_) => FaktoryResponse::Ok,
+                Err(err) => FaktoryResponse::Error(err.into()),
+            },
+            FaktoryCommand::BatchCommit(batch_id) => {
+                match connection.batch_commit(batch_id).await {
+                    Ok(_) => FaktoryResponse::Ok,
+                    Err(err) => FaktoryResponse::Error(err.into()),
+                }
+            }
+            FaktoryCommand::BatchNew(batch_config) => {
+                match connection.batch_new(*batch_config).await {
+                    Ok(_) => FaktoryResponse::Ok,
+                    Err(err) => FaktoryResponse::Error(err.into()),
+                }
+            }
+            FaktoryCommand::Beat => match connection.beat().await {
+                Ok(beat_state) => FaktoryResponse::Beat(beat_state),
+                Err(err) => FaktoryResponse::Error(err.into()),
+            },
+            FaktoryCommand::Fetch(queues) => match connection.fetch(&queues).await {
+                Ok(job) => FaktoryResponse::Job(job.map(Into::into)),
+                Err(err) => FaktoryResponse::Error(err.into()),
+            },
+            FaktoryCommand::Fail(fail_config) => match connection.fail(fail_config).await {
+                Ok(_) => FaktoryResponse::Ok,
+                Err(err) => FaktoryResponse::Error(err.into()),
+            },
+            FaktoryCommand::GetLastBeat => FaktoryResponse::Beat(connection.last_beat()),
+            FaktoryCommand::Push(job) => match connection.push(*job).await {
+                Ok(_) => FaktoryResponse::Ok,
+                Err(err) => {
+                    // info!("Error pushing job to faktory: {err}");
+                    FaktoryResponse::Error(err.into())
+                }
+            },
+            // End is handled in handle_msg
+            _ => unimplemented!("this should not be reached"),
+        }
+    }
 
-                        // We sent end, so we should die, no matter what
-                        return;
+    // Attempts to connect to faktory with exponential backoff
+    async fn attempt_connect(config: &Config) -> Option<Connection> {
+        // 14 retries is 2^14 = 16,384 seconds or 4.5 hours
+        for retries in 0..15 {
+            match Connection::new(config.clone()).await {
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_secs(1 << retries)).await;
+                }
+                Ok(connection) => return Some(connection),
+            }
+        }
+
+        None
+    }
+
+    // Spawns a task that owns our connection to the faktory server
+    // Right now we panic if it takes 4 hours to get a connection
+    fn spawn_faktory_connection(&self, mut command_receiver: FaktoryCommandReceiver) {
+        let config = self.config.clone();
+        let beat_shutdown_sender = self.beat_shutdown_sender.clone();
+        tokio::task::spawn(async move {
+            let mut connection = Client::attempt_connect(&config).await.unwrap();
+            let mut last_command_outcome: CommandOutcome = CommandOutcome::Ok;
+
+            loop {
+                match last_command_outcome {
+                    CommandOutcome::Shutdown => return,
+                    CommandOutcome::Reconnect => {
+                        connection = Client::attempt_connect(&config).await.unwrap();
                     }
-                    FaktoryCommand::Fetch(queues) => match connection.fetch(&queues).await {
-                        Ok(job) => {
-                            response.send(FaktoryResponse::Job(job.map(Into::into))).unwrap();
-                        }
-                        Err(err) => {
-                            response.send(FaktoryResponse::Error(err.into())).unwrap();
-                        }
-                    },
-                    FaktoryCommand::Fail(fail_config) => match connection.fail(fail_config).await {
-                        Ok(_) => {
-                            response.send(FaktoryResponse::Ok).unwrap();
-                        }
-                        Err(err) => {
-                            response.send(FaktoryResponse::Error(err.into())).unwrap();
-                        }
-                    },
-                    FaktoryCommand::GetLastBeat => {
-                        response
-                            .send(FaktoryResponse::Beat(connection.last_beat()))
-                            .unwrap();
-                    }
-                    FaktoryCommand::Push(job) => match connection.push(*job).await {
-                        Ok(_) => {
-                            response.send(FaktoryResponse::Ok).unwrap();
-                        }
-                        Err(err) => {
-                            // info!("Error pushing job to faktory: {err}");
-                            response.send(FaktoryResponse::Error(err.into())).unwrap();
-                        }
-                    },
+                    CommandOutcome::Ok => {}
+                };
+
+                if let Some(msg) = command_receiver.recv().await {
+                    last_command_outcome =
+                        Client::handle_msg(msg, &mut connection, beat_shutdown_sender.clone())
+                            .await;
                 }
             }
         });
@@ -288,10 +313,7 @@ impl Client {
 
     // If we're a worker, spawn a heartbeat task that sends a BEAT message to faktory every
     // ~15 seconds
-    fn spawn_heartbeat(
-        &self,
-        mut beat_shutdown_channel: broadcast::Receiver<()>,
-    ) {
+    fn spawn_heartbeat(&self, mut beat_shutdown_channel: broadcast::Receiver<()>) {
         let clone = self.clone();
         tokio::task::spawn(async move {
             loop {
@@ -353,11 +375,36 @@ mod tests {
         let mut jobs = vec![];
         while let Ok(Some(job)) = client.fetch(&[queue.clone()]).await {
             jobs.push(job.clone());
-            client.ack(job.id().to_string()).await.expect("could not ack");
+            client
+                .ack(job.id().to_string())
+                .await
+                .expect("could not ack");
         }
 
         assert_eq!(5, jobs.len());
 
         let _ = client.end().await;
+    }
+
+    // To use this test, you'll want to start it with faktory down, start faktory, then
+    // shut faktory down, then bring it back up, and ensure we reconnect in every case.
+    // runs in an infinite loop
+    #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+    #[ignore]
+    async fn it_handles_disconnects() {
+        let client = Client::new(
+            &Config::from_uri(
+                "localhost:7419",
+                Some("test".to_string()),
+                Some(Uuid::new_v4().to_string()),
+            ),
+            256,
+        );
+
+        let queue = Uuid::new_v4().to_string();
+
+        loop {
+            let _ = dbg!(client.fetch(&[queue.clone()]).await);
+        }
     }
 }
