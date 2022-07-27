@@ -1,8 +1,9 @@
 mod error;
 
 pub use crate::error::{Error, Result};
-pub use faktory_lib_async::{BatchConfig, BeatState, Config, Connection, FailConfig, Job};
 
+pub use faktory_lib_async::{BatchConfig, BeatState, Config, Connection, FailConfig, Job};
+use rand::{thread_rng, Rng};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -186,7 +187,6 @@ impl Client {
                 // If the response receiver has gone away, it's because the caller killed it's tokio task
                 // That means faktory will still get the command, but the caller won't get the response
                 // So we can safely ignore channel failures here
-
                 Err(faktory_lib_async::Error::ReceivedErrorMessage(kind, msg)) => {
                     let _ = responder.send(FaktoryResponse::Error(kind, msg));
                     break;
@@ -195,7 +195,6 @@ impl Client {
                     let _ = responder.send(ok_response);
                     break;
                 }
-
 
                 Err(_err) => {
                     // TODO: is there a case where retrying will keep failing because the user provided data
@@ -246,23 +245,24 @@ impl Client {
         }
     }
 
-    // Attempts to connect to faktory with exponential backoff. Largest sleep is 32 seconds
+    // Attempts to connect to faktory with exponential backoff + jitter. Largest sleep is 32 seconds
     async fn attempt_connect(
         config: &Config,
         mut shutdown_channel: broadcast::Receiver<()>,
     ) -> Option<Connection> {
-        let mut backoff = 0;
+        let mut backoff = 1;
         loop {
             match shutdown_channel.try_recv() {
                 Err(broadcast::error::TryRecvError::Empty) => {}
                 _ => break,
             }
 
+            let jitter = thread_rng().gen_range(1..=backoff);
             match dbg!(Connection::new(config.clone()).await) {
                 Err(_) => {
                     tokio::select! {
                         _ = shutdown_channel.recv() => break,
-                        _ = tokio::time::sleep(Duration::from_secs(1 << backoff)) => {}
+                        _ = tokio::time::sleep(Duration::from_secs(1 << jitter)) => {}
                     }
                 }
                 Ok(connection) => return Some(connection),
@@ -314,16 +314,17 @@ impl Client {
     }
 
     // If we're a worker, spawn a heartbeat task that sends a BEAT message to faktory every
-    // ~15 seconds
+    // ~15 seconds with (-5..5) seconds of jitter
     fn spawn_heartbeat(&self, mut shutdown_channel: broadcast::Receiver<()>) {
         let clone = self.clone();
         tokio::task::spawn(async move {
             loop {
                 let _ = clone.beat().await;
 
+                let interval = thread_rng().gen_range(10..20);
                 tokio::select! {
                     _ = shutdown_channel.recv() => break,
-                    _ = tokio::time::sleep(Duration::from_secs(15)) => {}
+                    _ = tokio::time::sleep(Duration::from_secs(interval)) => {}
                 }
             }
         });
@@ -417,5 +418,27 @@ mod tests {
         client.close().expect("able to close connection");
 
         tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+    async fn it_returns_faktory_err() {
+        let client = Client::new(
+            Config::from_uri(
+                "localhost:7419",
+                Some("test".to_string()),
+                Some(Uuid::new_v4().to_string()),
+            ),
+            256,
+        );
+
+        assert!(client
+            .fail(FailConfig::new(
+                "doesnt exist".to_owned(),
+                "yeahhhh".to_owned(),
+                "inexistent".to_owned(),
+                None
+            ))
+            .await
+            .is_err());
     }
 }
