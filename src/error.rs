@@ -8,6 +8,9 @@ pub enum Error {
     #[error("unexpected response: got {0}, expected {1}")]
     UnexpectedResponse(String, String),
 
+    #[error("client closed, create a new one")]
+    ClientClosed,
+
     #[error("oneshot allocated to get the faktory response for request went away: {0}")]
     ReceiveResponse(#[from] tokio::sync::oneshot::error::RecvError),
     #[error("local queue has gone away, unable to send command, this faktory_async::Client isn't recoverable anymore")]
