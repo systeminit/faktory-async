@@ -6,11 +6,11 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-serde_json = "1"
-serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "sync", "rt", "time"] }
 thiserror = "1"
-chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.0.0", features = ["v4"] }
 faktory-lib-async = { git = "https://github.com/systeminit/faktory-lib-async", branch = "main" }
 rand = "0.8"
+
+[dev-dependencies]
+uuid = { version = "1.0.0", features = ["v4"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
