@@ -4,7 +4,7 @@ pub use crate::error::{Error, Result};
 
 pub use faktory_lib_async::{BatchConfig, BeatState, Config, Connection, FailConfig, Job};
 use rand::{thread_rng, Rng};
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 #[derive(Debug)]
@@ -36,7 +36,16 @@ type FaktoryCommandReceiver = mpsc::Receiver<FaktoryCommandMessage>;
 pub struct Client {
     config: Config,
     command_sender: FaktoryCommandSender,
+    rc: Arc<()>,
     shutdown_sender: broadcast::Sender<()>,
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.rc) == 1 {
+            let _ = self.shutdown_sender.send(());
+        }
+    }
 }
 
 impl Client {
@@ -51,6 +60,7 @@ impl Client {
             config,
             command_sender,
             shutdown_sender,
+            rc: Default::default(),
         };
 
         client.spawn_faktory_connection(command_receiver, shutdown_channel.resubscribe());
