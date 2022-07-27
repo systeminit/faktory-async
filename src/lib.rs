@@ -71,7 +71,7 @@ impl Client {
         }
     }
 
-    pub async fn last_beat(&mut self) -> Result<BeatState> {
+    pub async fn last_beat(&self) -> Result<BeatState> {
         match self.send_command(FaktoryCommand::GetLastBeat).await? {
             FaktoryResponse::Beat(beat_state) => Ok(beat_state),
             other => Err(Error::UnexpectedResponse(
