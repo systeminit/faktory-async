@@ -4,8 +4,17 @@ pub use crate::error::{Error, Result};
 
 pub use faktory_lib_async::{BatchConfig, BeatState, Config, Connection, FailConfig, Job};
 use rand::{thread_rng, Rng};
-use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration, borrow::Cow,
+};
+use tokio::sync::{
+    mpsc::{self, error::TrySendError},
+    oneshot,
+};
 
 #[derive(Debug)]
 enum FaktoryResponse {
@@ -23,7 +32,7 @@ enum FaktoryCommand {
     BatchNew(Box<BatchConfig>),
     Beat,
     Fail(FailConfig),
-    Fetch(Vec<String>),
+    Fetch(Vec<Cow<'static, str>>),
     GetLastBeat,
     Push(Box<Job>),
 }
@@ -35,8 +44,26 @@ type FaktoryCommandReceiver = mpsc::Receiver<FaktoryCommandMessage>;
 #[derive(Debug, Clone)]
 pub struct Client {
     config: Config,
+    // The heartbeat task also will have one of these so we can't assume we will own the last one
     command_sender: FaktoryCommandSender,
-    shutdown_sender: broadcast::Sender<()>,
+    shutdown_request_tx: mpsc::Sender<()>,
+    // Helps the user to identify that the queue is being emptied and that no new commands will be accepted
+    // We have to cache to avoid messing with the mpsc::Receiver's state
+    shutdown_request_cached: Arc<AtomicBool>,
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        // Initiate shutdown if we are the last Client tied to the underlying tasks
+        if Arc::strong_count(&self.shutdown_request_cached) == 1 {
+            // Only failures possible are Full and Close
+            // If queue is full someone already scheduled the shutdown (by calling `Self::close`) so we don't need to do it again
+            // If queue is closed the command task has gone away, so we already are effectively shutdown
+            let _ = self.shutdown_request_tx.try_send(());
+
+            // Since we are the last Client we don't need to update the shutdown_request_cached Arc
+        }
+    }
 }
 
 impl Client {
@@ -44,19 +71,21 @@ impl Client {
         let (command_sender, command_receiver) =
             mpsc::channel::<FaktoryCommandMessage>(channel_size);
 
-        let (shutdown_sender, shutdown_channel) = broadcast::channel(1);
-
         let has_wid = config.worker_id.is_some();
+        let (shutdown_request_tx, shutdown_request_rx) = mpsc::channel(1);
         let client = Self {
             config,
             command_sender,
-            shutdown_sender,
+            shutdown_request_tx,
+            shutdown_request_cached: Default::default(),
         };
 
-        client.spawn_faktory_connection(command_receiver, shutdown_channel.resubscribe());
+        let (beat_shutdown_tx, beat_shutdown_rx) = oneshot::channel();
+
+        client.spawn_faktory_connection(command_receiver, shutdown_request_rx, beat_shutdown_tx);
 
         if has_wid {
-            client.spawn_heartbeat(shutdown_channel);
+            client.spawn_heartbeat(beat_shutdown_rx);
         }
 
         client
@@ -82,9 +111,9 @@ impl Client {
         }
     }
 
-    pub async fn fetch(&self, queues: &[String]) -> Result<Option<Job>> {
+    pub async fn fetch(&self, queues: Vec<Cow<'static, str>>) -> Result<Option<Job>> {
         match self
-            .send_command(FaktoryCommand::Fetch(queues.to_owned()))
+            .send_command(FaktoryCommand::Fetch(queues))
             .await?
         {
             FaktoryResponse::Job(Some(job)) => Ok(Some(*job)),
@@ -152,16 +181,33 @@ impl Client {
         }
     }
 
-    /// Close the Faktory client. Will shutdown the connection task as well as the
-    /// beat task (if running). If we still have a connection to faktory, this will
-    /// send the END command as well.
-    pub fn close(&self) -> Result<()> {
-        // If the receiver isn't there, there is nothing to close
-        let _ = self.shutdown_sender.send(());
+    /// Initiates the shutdown procedure, which will eventually close the Faktory client.
+    /// The shutdown will only be finalized after the last enqueued command has been processed.
+    /// New commands can't be enqueued after this. It will result in a `Error::ClientClosed`.
+    ///
+    /// Will shutdown the connection task as well as the beat task (if running)
+    /// If we still have a connection to faktory, this will send the END command as well.
+    pub fn close(self) -> Result<()> {
+        // Only failures possible are Full and Close
+        // If queue is full someone already scheduled the shutdown (by calling `Self::close`) so we don't need to do it again
+        // If queue is closed the command task has gone away, so we already are effectively shutdown
+        let _ = self.shutdown_request_tx.try_send(());
+
+        // TODO: check if relaxed is enough (it probably is as this is the only atomic used, things get messy with more than 1 atomic)
+        self.shutdown_request_cached.store(true, Ordering::Relaxed);
         Ok(())
     }
 
+    pub fn is_shutting_down(&self) -> bool {
+        // TODO: check if relaxed is enough (it probably is as this is the only atomic used, things get messy with more than 1 atomic)
+        self.shutdown_request_cached.load(Ordering::Relaxed)
+    }
+
     async fn send_command(&self, command: FaktoryCommand) -> Result<FaktoryResponse> {
+        if self.is_shutting_down() {
+            return Err(Error::ClientClosed);
+        }
+
         let (response_sender, response_receiver) = oneshot::channel();
 
         self.command_sender
@@ -174,12 +220,7 @@ impl Client {
         }
     }
 
-    async fn handle_msg(
-        msg: FaktoryCommandMessage,
-        connection: &mut Connection,
-        config: &Config,
-        shutdown_channel: &broadcast::Receiver<()>,
-    ) {
+    async fn handle_msg(msg: FaktoryCommandMessage, connection: &mut Connection, config: &Config) {
         let (cmd, responder) = msg;
 
         loop {
@@ -203,9 +244,7 @@ impl Client {
 
                     //error!("faktory_lib_async returned a critical error, reconnecting and trying to send the message again: {_err}");
 
-                    if let Some(conn) =
-                        Client::attempt_connect(config, shutdown_channel.resubscribe()).await
-                    {
+                    if let Some(conn) = Client::attempt_connect(config).await {
                         *connection = conn;
                     }
 
@@ -233,7 +272,7 @@ impl Client {
                 .map(FaktoryResponse::BatchId),
             FaktoryCommand::Beat => connection.beat().await.map(FaktoryResponse::Beat),
             FaktoryCommand::Fetch(queues) => connection
-                .fetch(&queues.iter().map(|q| q.as_str()).collect::<Vec<_>>())
+                .fetch(&queues)
                 .await
                 .map(|job| FaktoryResponse::Job(job.map(Into::into))),
             FaktoryCommand::Fail(fail_config) => connection
@@ -246,86 +285,115 @@ impl Client {
     }
 
     // Attempts to connect to faktory with exponential backoff + jitter. Largest sleep is 32 seconds
-    async fn attempt_connect(
-        config: &Config,
-        mut shutdown_channel: broadcast::Receiver<()>,
-    ) -> Option<Connection> {
+    async fn attempt_connect(config: &Config) -> Option<Connection> {
         let mut backoff = 1;
         loop {
-            match shutdown_channel.try_recv() {
-                Err(broadcast::error::TryRecvError::Empty) => {}
-                _ => break,
-            }
-
             let jitter = thread_rng().gen_range(1..=backoff);
             match dbg!(Connection::new(config.clone()).await) {
-                Err(_) => {
-                    tokio::select! {
-                        _ = shutdown_channel.recv() => break,
-                        _ = tokio::time::sleep(Duration::from_secs(1 << jitter)) => {}
-                    }
-                }
                 Ok(connection) => return Some(connection),
+                Err(_) => tokio::time::sleep(Duration::from_secs(1 << jitter)).await,
             }
 
             if backoff < 5 {
                 backoff += 1;
             }
         }
-
-        None
     }
 
     // Spawns a task that owns our connection to the faktory server
     fn spawn_faktory_connection(
         &self,
         mut command_receiver: FaktoryCommandReceiver,
-        mut shutdown_channel: broadcast::Receiver<()>,
+        mut shutdown_request_rx: mpsc::Receiver<()>,
+        beat_shutdown_tx: oneshot::Sender<()>,
     ) {
         let config = self.config.clone();
+        let shutdown_request_tx = self.shutdown_request_tx.clone();
 
         tokio::task::spawn(async move {
-            let mut connection =
-                Client::attempt_connect(&config, shutdown_channel.resubscribe()).await;
+            let mut connection = None;
 
             loop {
-                match connection {
-                    None => {
-                        let shutdown_channel2 = shutdown_channel.resubscribe();
-                        connection = tokio::select! {
-                            _ = shutdown_channel.recv() => break,
-                            conn = Client::attempt_connect(&config, shutdown_channel2) => conn,
-                        }
-                    }
-                    Some(ref mut connection) => {
-                        tokio::select! {
-                            Some(msg) = command_receiver.recv() => {
-                                Client::handle_msg(msg, connection, &config, &shutdown_channel).await
+                let msg = tokio::select! {
+                    msg = command_receiver.recv() => match msg {
+                        Some(msg) => msg,
+
+                        // If no messages are in the channel and the sender is closed we can bail out
+                        // The sender can only be closed after all `Client`s have been dropped and the heartbeat task has ended
+                        // The heartbeat task should never go away before this task does, so this should be unreachable
+                        None => unreachable!(),
+                    },
+
+                    _ = shutdown_request_rx.recv() => {
+                        // Since we must shutdown, nothing can be enqueued anymore. If the queue is empty we bail out.
+                        // If not, we empty it and reschedule the shutdown as we just consumed the shutdown command
+                        match command_receiver.try_recv() {
+                            Err(_) => break,
+                            Ok(msg) => {
+                                // Only failures possible are Full and Close
+                                // If queue is full someone raced with us by scheduling the shutdown (by calling `Self::close`) so we don't need to do it again
+                                // Closed should be impossible as this task owns the receiver, it will never go away from under us and we never call close on it
+                                if let Err(TrySendError::Closed(_)) = shutdown_request_tx.try_send(()) {
+                                    unreachable!();
+                                }
+                                msg
                             }
-                            _ = shutdown_channel.recv() => {
-                                let _ = connection.end().await;
-                                break;
-                            }
                         }
+                    },
+                };
+
+                // We have a job to do, we must keep going until it's finished otherwise it will be lost with the rest of the channel
+                loop {
+                    match &mut connection {
+                        Some(connection) => {
+                            Client::handle_msg(msg, connection, &config).await;
+                            break;
+                        }
+                        None => connection = Client::attempt_connect(&config).await,
                     }
                 }
+            }
+
+            // This can only fail if beat_shutdown_rx has gone away, which means the heartbeat task has already shutdown
+            // (it should never happen tho)
+            if beat_shutdown_tx.send(()).is_err() {
+                unreachable!();
+            }
+
+            if let Some(mut conn) = connection {
+                // If end fails let's just close the connection without it, it's not a big deal
+                let _ = conn.end().await;
             }
         });
     }
 
     // If we're a worker, spawn a heartbeat task that sends a BEAT message to faktory every
     // ~15 seconds with (-5..5) seconds of jitter
-    fn spawn_heartbeat(&self, mut shutdown_channel: broadcast::Receiver<()>) {
-        let clone = self.clone();
+    fn spawn_heartbeat(&self, shutdown_rx: oneshot::Receiver<()>) {
+        let command_sender = self.command_sender.clone();
         tokio::task::spawn(async move {
-            loop {
-                let _ = clone.beat().await;
+            tokio::select! {
+                _ = shutdown_rx => {},
+                _ = async {
+                    loop {
+                        // We have to manually implement the beat function here to avoid cloning the shutdown_request_cached Arc
+                        // Otherwise the shutdown procedure won't start
+                        let (response_sender, response_receiver) = oneshot::channel();
+                        if command_sender.send((FaktoryCommand::Beat, response_sender)).await.is_err() {
+                            // If the command_receiver has gone away, the executor task isn't available so we can just bail out
+                            break;
+                        }
 
-                let interval = thread_rng().gen_range(10..20);
-                tokio::select! {
-                    _ = shutdown_channel.recv() => break,
-                    _ = tokio::time::sleep(Duration::from_secs(interval)) => {}
-                }
+                        // If beat fails we will try again soon, before the 60 seconds limit
+                        // The enqueued command execution logic will reconnect when needed
+                        //
+                        // Will we have a problem if beat takes too long? Or of it fails ~=6 times in a row?
+                        let _ = response_receiver.await;
+
+                        let interval = thread_rng().gen_range(10..20);
+                        tokio::time::sleep(Duration::from_secs(interval)).await;
+                    }
+                } => {}
             }
         });
     }
@@ -348,8 +416,7 @@ mod tests {
         );
 
         let queue = Uuid::new_v4().to_string();
-        let fetch_result = client.fetch(&[queue.clone()]).await;
-        assert!(fetch_result.is_ok());
+        let fetch_result = client.fetch(vec![queue.clone().into()]).await;
         assert!(fetch_result.unwrap().is_none());
 
         for _ in 0..5 {
@@ -366,7 +433,7 @@ mod tests {
         }
 
         let mut jobs = vec![];
-        while let Ok(Some(job)) = client.fetch(&[queue.clone()]).await {
+        while let Ok(Some(job)) = client.fetch(vec![queue.clone().into()]).await {
             jobs.push(job.clone());
             client
                 .ack(job.id().to_string())
@@ -396,7 +463,7 @@ mod tests {
 
         let queue = Uuid::new_v4().to_string();
 
-        while dbg!(client.fetch(&[queue.clone()]).await).is_err() {
+        while dbg!(client.fetch(vec![queue.clone().into()]).await).is_err() {
             println!("Retrying");
         }
     }
