@@ -332,13 +332,15 @@ impl Client {
         mut command_receiver: FaktoryCommandReceiver,
         mut shutdown_request_rx: mpsc::Receiver<()>,
         beat_shutdown_tx: oneshot::Sender<()>,
-        // Used as a drop guard, when all wait_for_shutdown_tx are dropped recv will stop blocking
-        _wait_for_shutdown_tx: broadcast::Sender<()>,
+        wait_for_shutdown_tx: broadcast::Sender<()>,
     ) {
         let config = self.config.clone();
         let shutdown_request_tx = self.shutdown_request_tx.clone();
 
         tokio::task::spawn(async move {
+            // Used as a drop guard, when all wait_for_shutdown_tx are dropped recv will stop blocking
+            let _wait_for_shutdown_tx = wait_for_shutdown_tx;
+
             let mut connection = None;
 
             loop {
@@ -397,11 +399,13 @@ impl Client {
     fn spawn_heartbeat(
         &self,
         shutdown_rx: oneshot::Receiver<()>,
-        // Used as a drop guard, when all wait_for_shutdown_tx are dropped recv will stop blocking
-        _wait_for_shutdown_tx: broadcast::Sender<()>,
+        wait_for_shutdown_tx: broadcast::Sender<()>,
     ) {
         let command_sender = self.command_sender.clone();
         tokio::task::spawn(async move {
+            // Used as a drop guard, when all wait_for_shutdown_tx are dropped recv will stop blocking
+            let _wait_for_shutdown_tx = wait_for_shutdown_tx;
+
             tokio::select! {
                 _ = shutdown_rx => {},
                 _ = async {
