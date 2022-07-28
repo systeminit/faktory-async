@@ -5,13 +5,15 @@ pub use crate::error::{Error, Result};
 pub use faktory_lib_async::{BatchConfig, BeatState, Config, Connection, FailConfig, Job};
 use rand::{thread_rng, Rng};
 use std::{
+    borrow::Cow,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration, borrow::Cow,
+    time::Duration,
 };
 use tokio::sync::{
+    broadcast,
     mpsc::{self, error::TrySendError},
     oneshot,
 };
@@ -41,15 +43,31 @@ type FaktoryCommandMessage = (FaktoryCommand, oneshot::Sender<FaktoryResponse>);
 type FaktoryCommandSender = mpsc::Sender<FaktoryCommandMessage>;
 type FaktoryCommandReceiver = mpsc::Receiver<FaktoryCommandMessage>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Client {
     config: Config,
     // The heartbeat task also will have one of these so we can't assume we will own the last one
     command_sender: FaktoryCommandSender,
     shutdown_request_tx: mpsc::Sender<()>,
+    wait_for_shutdown_rx: broadcast::Receiver<()>,
     // Helps the user to identify that the queue is being emptied and that no new commands will be accepted
     // We have to cache to avoid messing with the mpsc::Receiver's state
     shutdown_request_cached: Arc<AtomicBool>,
+}
+
+impl Clone for Client {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            command_sender: self.command_sender.clone(),
+            shutdown_request_tx: self.shutdown_request_tx.clone(),
+            // It's annoying that broadcast receiver doesn't implement clone
+            // We never send anything to it, so we don't need to fear data loss on resubscribe
+            // It uses the drop pattern so it blocks until all tx are dropped
+            wait_for_shutdown_rx: self.wait_for_shutdown_rx.resubscribe(),
+            shutdown_request_cached: self.shutdown_request_cached.clone(),
+        }
+    }
 }
 
 impl Drop for Client {
@@ -73,19 +91,26 @@ impl Client {
 
         let has_wid = config.worker_id.is_some();
         let (shutdown_request_tx, shutdown_request_rx) = mpsc::channel(1);
+        let (wait_for_shutdown_tx, wait_for_shutdown_rx) = broadcast::channel(1);
         let client = Self {
             config,
             command_sender,
             shutdown_request_tx,
+            wait_for_shutdown_rx,
             shutdown_request_cached: Default::default(),
         };
 
         let (beat_shutdown_tx, beat_shutdown_rx) = oneshot::channel();
 
-        client.spawn_faktory_connection(command_receiver, shutdown_request_rx, beat_shutdown_tx);
+        client.spawn_faktory_connection(
+            command_receiver,
+            shutdown_request_rx,
+            beat_shutdown_tx,
+            wait_for_shutdown_tx.clone(),
+        );
 
         if has_wid {
-            client.spawn_heartbeat(beat_shutdown_rx);
+            client.spawn_heartbeat(beat_shutdown_rx, wait_for_shutdown_tx);
         }
 
         client
@@ -112,10 +137,7 @@ impl Client {
     }
 
     pub async fn fetch(&self, queues: Vec<Cow<'static, str>>) -> Result<Option<Job>> {
-        match self
-            .send_command(FaktoryCommand::Fetch(queues))
-            .await?
-        {
+        match self.send_command(FaktoryCommand::Fetch(queues)).await? {
             FaktoryResponse::Job(Some(job)) => Ok(Some(*job)),
             FaktoryResponse::Job(None) => Ok(None),
             other => Err(Error::UnexpectedResponse(
@@ -187,7 +209,7 @@ impl Client {
     ///
     /// Will shutdown the connection task as well as the beat task (if running)
     /// If we still have a connection to faktory, this will send the END command as well.
-    pub fn close(self) -> Result<()> {
+    pub async fn close(mut self) -> Result<()> {
         // Only failures possible are Full and Close
         // If queue is full someone already scheduled the shutdown (by calling `Self::close`) so we don't need to do it again
         // If queue is closed the command task has gone away, so we already are effectively shutdown
@@ -195,6 +217,10 @@ impl Client {
 
         // TODO: check if relaxed is enough (it probably is as this is the only atomic used, things get messy with more than 1 atomic)
         self.shutdown_request_cached.store(true, Ordering::Relaxed);
+
+        // Will bail out when tx is dropped, so we know all tasks are gone
+        let _ = self.wait_for_shutdown_rx.recv().await;
+
         Ok(())
     }
 
@@ -272,7 +298,7 @@ impl Client {
                 .map(FaktoryResponse::BatchId),
             FaktoryCommand::Beat => connection.beat().await.map(FaktoryResponse::Beat),
             FaktoryCommand::Fetch(queues) => connection
-                .fetch(&queues)
+                .fetch(queues)
                 .await
                 .map(|job| FaktoryResponse::Job(job.map(Into::into))),
             FaktoryCommand::Fail(fail_config) => connection
@@ -306,6 +332,8 @@ impl Client {
         mut command_receiver: FaktoryCommandReceiver,
         mut shutdown_request_rx: mpsc::Receiver<()>,
         beat_shutdown_tx: oneshot::Sender<()>,
+        // Used as a drop guard, when all wait_for_shutdown_tx are dropped recv will stop blocking
+        _wait_for_shutdown_tx: broadcast::Sender<()>,
     ) {
         let config = self.config.clone();
         let shutdown_request_tx = self.shutdown_request_tx.clone();
@@ -319,9 +347,8 @@ impl Client {
                         Some(msg) => msg,
 
                         // If no messages are in the channel and the sender is closed we can bail out
-                        // The sender can only be closed after all `Client`s have been dropped and the heartbeat task has ended
-                        // The heartbeat task should never go away before this task does, so this should be unreachable
-                        None => unreachable!(),
+                        // The sender could be closed as a producer won't have a heartbeat task and all the Client's might be dropped
+                        None => break,
                     },
 
                     _ = shutdown_request_rx.recv() => {
@@ -355,10 +382,8 @@ impl Client {
             }
 
             // This can only fail if beat_shutdown_rx has gone away, which means the heartbeat task has already shutdown
-            // (it should never happen tho)
-            if beat_shutdown_tx.send(()).is_err() {
-                unreachable!();
-            }
+            // It shouldn't happen for consumers, but producers don't have a beat task
+            let _ = beat_shutdown_tx.send(());
 
             if let Some(mut conn) = connection {
                 // If end fails let's just close the connection without it, it's not a big deal
@@ -369,7 +394,12 @@ impl Client {
 
     // If we're a worker, spawn a heartbeat task that sends a BEAT message to faktory every
     // ~15 seconds with (-5..5) seconds of jitter
-    fn spawn_heartbeat(&self, shutdown_rx: oneshot::Receiver<()>) {
+    fn spawn_heartbeat(
+        &self,
+        shutdown_rx: oneshot::Receiver<()>,
+        // Used as a drop guard, when all wait_for_shutdown_tx are dropped recv will stop blocking
+        _wait_for_shutdown_tx: broadcast::Sender<()>,
+    ) {
         let command_sender = self.command_sender.clone();
         tokio::task::spawn(async move {
             tokio::select! {
@@ -443,7 +473,7 @@ mod tests {
 
         assert_eq!(5, jobs.len());
 
-        let _ = client.close();
+        let _ = client.close().await;
     }
 
     // To use this test, you'll want to start it with faktory down, start faktory, then
@@ -482,7 +512,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_secs(16)).await;
 
-        client.close().expect("able to close connection");
+        client.close().await.expect("able to close connection");
 
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
