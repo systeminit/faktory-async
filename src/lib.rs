@@ -51,18 +51,22 @@
 //!         let client = client.clone();
 //!         let queues = queues.clone();
 //!         let handle = tokio::spawn(async move {
-//!             let result = consume_job(&client, &queues).await;
+//!             let result = consume_jobs(&client, &queues).await;
 //!             println!("{:?}", result);
 //!         });
 //!         handles.push(handle);
 //!     }
 //! 
 //!     join_all(handles).await;
+//!
+//!     if let Err(err) = client.close().await {
+//!         println!("Error closing faktory connection");
+//!     }
 //! 
 //!     Ok(())
 //! }
 //! 
-//! async fn consume_job(client: &Client, queues: &[Cow<'static, str>]) -> FaktoryResult<()> {
+//! async fn consume_jobs(client: &Client, queues: &[Cow<'static, str>]) -> FaktoryResult<()> {
 //!     loop {
 //!         match client.last_beat().await? {
 //!             BeatState::Ok => {
