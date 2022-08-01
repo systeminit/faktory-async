@@ -3,7 +3,7 @@
 //! Experimental tokio-based client for the [Faktory Work
 //! Protocol](https://github.com/contribsys/faktory/blob/main/docs/protocol-specification.md).
 //!
-//! The `Client` spawns up two tokio tasks:
+//! The `Client` spawns up to two tokio tasks:
 //!
 //! 1. For every client, a task is spawned that owns the TCP connection to the faktory server and
 //!    handles sending and receiving messages from the server.
