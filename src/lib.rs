@@ -312,12 +312,13 @@ impl Client {
 
     // Attempts to connect to faktory with exponential backoff + jitter. Largest sleep is 32 seconds
     async fn attempt_connect(config: &Config) -> Option<Connection> {
-        let mut backoff = 1;
+        let mut backoff = 0;
         loop {
-            let jitter = thread_rng().gen_range(1..=backoff);
+            let backoff_ms = (1 << backoff) * 1000;
+            let jitter = thread_rng().gen_range(1..=backoff_ms);
             match dbg!(Connection::new(config.clone()).await) {
                 Ok(connection) => return Some(connection),
-                Err(_) => tokio::time::sleep(Duration::from_secs(1 << jitter)).await,
+                Err(_) => tokio::time::sleep(Duration::from_millis(jitter)).await,
             }
 
             if backoff < 5 {
