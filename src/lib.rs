@@ -1,3 +1,86 @@
+//! # `faktory-async`
+//!
+//! Experimental tokio-based client for the [Faktory Work
+//! Protocol](https://github.com/contribsys/faktory/blob/main/docs/protocol-specification.md).
+//!
+//! The `Client` spawns two tokio tasks:
+//!     1. A task that owns the TCP connection to the faktory server and handles sending and
+//!        receiving messages from the server.
+//!     2. When the client is configured as a job consumer, a heartbeat task that sends a BEAT
+//!        message to the faktory server approximately every 15-20 seconds, ensuring the faktory
+//!        server does not close the connection.
+//!
+//! Messages are dispatched to the connection task over tokio `mpsc` channels, with the response
+//! sent over a `oneshot`.
+//!
+//! The client task is intended to be used by long running consumers and producers, and will
+//! attempt to reconnect indefinitely to the faktory server if the connection is lost, using
+//! exponential backoff with jitter (the maximum sleep time before reconnecting is 32 seconds). It
+//! will also attempt to retry any faktory commands sent to the server if they fail because the
+//! connnection was lost. Any commands issued while attempting to reconnect will be stored in
+//! the message channel, and processed once the connection is re-established. You can use the
+//! channel size to control backpressure.
+//!
+//! Although the client spawns a heartbeat connection, it is up to the user of the client to handle
+//! the `BeatState::Quiet` and `BeatState::Terminate` messages as they see fit, by checking the
+//! return value of `Client::last_beat`.
+//!
+//! ## Example
+//!
+//! ```rust
+//! use faktory_async::{BeatState, Client, Config, Result as FaktoryResult};
+//! use futures::future::join_all;
+//! use std::borrow::Cow;
+//! 
+//! #[tokio::main]
+//! async fn main() -> FaktoryResult<()> {
+//!     let client = Client::new(
+//!         Config::from_uri(
+//!             "localhost:7419",
+//!             Some("worker-hostname".to_string()),
+//!             Some("worker-01".to_string()),
+//!         ),
+//!         128,
+//!     );
+//! 
+//!     let queues = vec![Cow::from("default".to_string())];
+//!     let mut handles = vec![];
+//! 
+//!     // Spawn five job workers
+//!     for _ in 0..5 {
+//!         let client = client.clone();
+//!         let queues = queues.clone();
+//!         let handle = tokio::spawn(async move {
+//!             let result = consume_job(&client, &queues).await;
+//!             println!("{:?}", result);
+//!         });
+//!         handles.push(handle);
+//!     }
+//! 
+//!     join_all(handles).await;
+//! 
+//!     Ok(())
+//! }
+//! 
+//! async fn consume_job(client: &Client, queues: &[Cow<'static, str>]) -> FaktoryResult<()> {
+//!     loop {
+//!         match client.last_beat().await? {
+//!             BeatState::Ok => {
+//!                 if let Some(job) = client.fetch(queues.to_vec()).await? {
+//!                     // Do something with the job
+//!                     // ACK it to remove it from the faktory queue
+//!                     client.ack(job.jid).await?
+//!                 }
+//!             }
+//!             BeatState::Quiet | BeatState::Terminate => {
+//!                 println!("Got Quiet or terminate, shutting down...");
+//!                 break Ok(());
+//!             }
+//!         }
+//!     }
+//! }
+//! ```
+//!
 mod error;
 
 pub use crate::error::{Error, Result};
