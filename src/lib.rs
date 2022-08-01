@@ -3,12 +3,13 @@
 //! Experimental tokio-based client for the [Faktory Work
 //! Protocol](https://github.com/contribsys/faktory/blob/main/docs/protocol-specification.md).
 //!
-//! The `Client` spawns two tokio tasks:
-//!     1. A task that owns the TCP connection to the faktory server and handles sending and
-//!        receiving messages from the server.
-//!     2. When the client is configured as a job consumer, a heartbeat task that sends a BEAT
-//!        message to the faktory server approximately every 15-20 seconds, ensuring the faktory
-//!        server does not close the connection.
+//! The `Client` spawns up two tokio tasks:
+//!
+//! 1. For every client, a task is spawned that owns the TCP connection to the faktory server and
+//!    handles sending and receiving messages from the server.
+//! 2. When the client is given a worker id in the `Config`, a heartbeat task is spawned that sends
+//!    a BEAT message to the faktory server approximately every 10-20 seconds, ensuring the faktory
+//!    server does not close the connection.
 //!
 //! Messages are dispatched to the connection task over tokio `mpsc` channels, with the response
 //! sent over a `oneshot`.
